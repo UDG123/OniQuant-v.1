@@ -18,6 +18,7 @@ from typing import Annotated, Any, AsyncGenerator
 
 import httpx
 import orjson
+import pandas as pd
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
@@ -31,6 +32,8 @@ from sqlalchemy.orm import DeclarativeBase
 
 from src.services.signal_hydration import HydrationError, hydrate_signal
 from src.services.telegram_broadcaster import broadcast_trade
+from src.strategies.desk3_swing import Desk3SwingStrategy
+from src.strategies.desk4_gold import Desk4GoldStrategy
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -215,12 +218,14 @@ async def tradingview_alert(
 
     Pipeline stages
     ---------------
-    1. Pydantic validation  (automatic via ``payload``).
-    2. Redis dedup          — drop duplicates, return 202.
-    3. Volatility lock      — veto + log to Postgres, return 202.
-    4. Desk state fetch     — ``get_desk_state(desk_id)``.
-    5. Signal hydration     — ``hydrate_signal(dict, dict) -> bytes``.
-    6. ClaudeCTO dispatch   — Consensus Score evaluation.
+    1.  Pydantic validation   (automatic via ``payload``).
+    2.  Redis dedup           — drop duplicates, return 202.
+    3.  Volatility lock       — veto + log to Postgres, return 202.
+    4.  Desk state fetch      — ``get_desk_state(desk_id)``.
+    4b. Strategy evaluation   — Desk 3 Lorentzian / Desk 4 Gold breakout.
+    5.  Signal hydration      — ``hydrate_signal(dict, dict) -> bytes``.
+    6.  ClaudeCTO dispatch    — Consensus Score evaluation.
+    7.  Telegram broadcast    — fire-and-forget notification.
     """
     redis = request.app.state.redis
 
@@ -271,6 +276,45 @@ async def tradingview_alert(
     # ------------------------------------------------------------------
     desk_state: dict = await redis.get_desk_state(payload.desk_id)
     desk_state.setdefault("desk_id", payload.desk_id)
+
+    # ------------------------------------------------------------------
+    # Stage 4b — Quantitative strategy evaluation
+    # ------------------------------------------------------------------
+    ohlcv = desk_state.get("ohlcv")
+    df = pd.DataFrame(ohlcv) if ohlcv is not None else None
+
+    if payload.desk_id == 3 and df is not None and not df.empty:
+        strategy = Desk3SwingStrategy()
+        result = strategy.evaluate(df)
+        desk_state["is_valid_setup"] = result.is_valid_setup
+        desk_state["lorentzian_score"] = result.lorentzian_score
+        desk_state["swing_trend_direction"] = result.trend_direction
+        desk_state["rsi"] = result.rsi
+        desk_state["adx"] = result.adx
+        desk_state["strategy"] = "desk3_lorentzian_swing"
+        logger.info(
+            "Desk 3 Lorentzian eval for %s: valid=%s score=%.4f",
+            payload.signal_id,
+            result.is_valid_setup,
+            result.lorentzian_score,
+        )
+
+    elif payload.desk_id == 4 and df is not None and not df.empty:
+        resistance = desk_state.get("resistance", 0.0)
+        support = desk_state.get("support", 0.0)
+        strategy = Desk4GoldStrategy()
+        result = strategy.evaluate(df, resistance=resistance, support=support)
+        desk_state["is_valid_breakout"] = result.is_valid_breakout
+        desk_state["risk_reward_ratio"] = result.risk_reward_ratio
+        desk_state["atr"] = result.atr
+        desk_state["gold_trend_direction"] = result.trend_direction
+        desk_state["strategy"] = "desk4_gold_breakout"
+        logger.info(
+            "Desk 4 Gold eval for %s: breakout=%s rr=%.4f",
+            payload.signal_id,
+            result.is_valid_breakout,
+            result.risk_reward_ratio,
+        )
 
     # ------------------------------------------------------------------
     # Stage 5 — Signal hydration
