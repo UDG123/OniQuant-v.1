@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from src.services.signal_hydration import HydrationError, hydrate_signal
+from src.services.telegram_broadcaster import broadcast_trade
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -299,6 +300,19 @@ async def tradingview_alert(
         "Signal %s processed — consensus_score=%s",
         payload.signal_id,
         cto_result.get("consensus_score"),
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 7 — Telegram broadcast (fire-and-forget)
+    # ------------------------------------------------------------------
+    await broadcast_trade(
+        {
+            "desk_id": payload.desk_id,
+            "action": payload.action,
+            "symbol": payload.symbol,
+            "price": payload.price,
+            "consensus_score": cto_result.get("consensus_score"),
+        }
     )
 
     return ORJSONResponse(
