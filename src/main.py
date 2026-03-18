@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
+from src.api.webhooks import router as webhooks_router
 from src.services.redis_manager import RedisStateManager
 
 
@@ -19,6 +20,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+app.include_router(webhooks_router)
 
 
 @app.get("/health")
