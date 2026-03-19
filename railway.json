@@ -78,6 +78,7 @@
         "builder": "DOCKERFILE",
         "dockerfilePath": "Dockerfile",
         "watchPatterns": [
+          "src/strategies/**",
           "src/core/**",
           "src/services/**",
           "src/workers/optimizer_job.py",
@@ -87,6 +88,30 @@
       },
       "deploy": {
         "startCommand": "celery -A src.workers.optimizer_job worker --beat --loglevel=info",
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 5
+      },
+      "envs": {
+        "POSTGRES_URL": { "$default": "${{shared.POSTGRES_URL}}" },
+        "REDIS_URL": { "$default": "${{shared.REDIS_URL}}" }
+      }
+    },
+    "OniQuant-Champion-Challenger": {
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "src/strategies/**",
+          "src/core/**",
+          "src/services/**",
+          "src/core/champion_challenger.py",
+          "requirements.txt",
+          "Dockerfile"
+        ]
+      },
+      "deploy": {
+        "startCommand": "celery -A src.core.champion_challenger worker --loglevel=info",
         "numReplicas": 1,
         "restartPolicyType": "ON_FAILURE",
         "restartPolicyMaxRetries": 5
