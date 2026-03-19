@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 
 import orjson
 
+from src.services.constitutional_manager import get_current_addendum
+
 SYSTEM_PROMPT = (
     "You are a financial CTO evaluating live trading signals. "
     "Analyze the provided market data, desk state, and webhook payload. "
@@ -28,11 +30,27 @@ def _validate_keys(payload: dict, required: tuple[str, ...], label: str) -> None
         raise HydrationError(f"Missing keys in {label}: {missing}")
 
 
+def _build_system_prompt() -> str:
+    """Assemble the system prompt, appending any active Constitutional Guardrail."""
+    addendum = get_current_addendum()
+    if not addendum:
+        return SYSTEM_PROMPT
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"--- Current Market Context (Constitutional Guardrail) ---\n"
+        f"{addendum}"
+    )
+
+
 async def hydrate_signal(
     raw_webhook_payload: dict,
     redis_desk_state: dict,
 ) -> bytes:
     """Merge webhook + desk state and attach the CTO system prompt.
+
+    When a Constitutional Guardrail is active it is appended to the
+    system prompt as a "Current Market Context" rule so the primary
+    ClaudeCTO agent factors recent failure patterns into its scoring.
 
     Returns
     -------
@@ -50,7 +68,7 @@ async def hydrate_signal(
     hydrated = {
         "webhook": raw_webhook_payload,
         "desk_state": redis_desk_state,
-        "system_prompt": SYSTEM_PROMPT,
+        "system_prompt": _build_system_prompt(),
         "hydrated_at": datetime.now(timezone.utc).isoformat(),
     }
 
