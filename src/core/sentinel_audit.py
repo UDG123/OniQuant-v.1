@@ -3,21 +3,24 @@
 Periodically queries ``trade_log`` and ``reasoning_logs`` to enforce two
 post-trade integrity invariants:
 
-1. **Causality Check** — the ClaudeCTO approval timestamp
+1. **Causality Check** — the ClaudeCTO ``approved_at`` timestamp
    (``reasoning_logs.created_at`` for APPROVED rows) must be *strictly*
-   earlier than the trade execution timestamp (``trade_log.opened_at``).
-   A violation indicates clock skew, race conditions, or data-pipeline
-   corruption.
+   earlier than the ``execution_price_timestamp``
+   (``trade_log.opened_at``).  A violation indicates clock skew, race
+   conditions, or data-pipeline corruption.
 
-2. **Slippage Audit** — the absolute delta between the signal price
-   embedded in the reasoning payload and the recorded fill price
-   (``trade_log.entry_price``) must not exceed 3× the ATR captured at
-   entry (``ml_training_data.atr_at_entry``).  Breaches are flagged for
-   manual review.
+2. **Slippage Audit** — the absolute delta between the ``signal_price``
+   embedded in the reasoning payload and the ``fill_price``
+   (``trade_log.entry_price``) must not exceed 3× the current ATR for
+   that asset (``ml_training_data.atr_at_entry``).  Breaches are flagged
+   for manual review.
 
 Every trade that fails either check produces a ``ForensicTrace`` JSON
-artifact written to the ``audit_artifacts/`` directory and logged at
-WARNING level.
+artifact that is:
+
+* written to the ``audit_artifacts/`` directory for offline analysis, and
+* persisted to the ``forensic_alerts`` PostgreSQL table for queryable
+  incident tracking and downstream dashboards.
 
 Usage — standalone::
 
@@ -41,8 +44,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    func,
+    text,
+)
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -62,6 +75,72 @@ _DEFAULT_LOOKBACK_HOURS: int = int(os.getenv("SENTINEL_LOOKBACK_HOURS", "24"))
 _ARTIFACT_DIR: str = os.getenv("SENTINEL_ARTIFACT_DIR", "audit_artifacts")
 
 logger = logging.getLogger("oniquant.core.sentinel_audit")
+
+# ---------------------------------------------------------------------------
+# ORM — forensic_alerts table
+# ---------------------------------------------------------------------------
+
+_Base = declarative_base()
+
+
+class ForensicAlert(_Base):
+    """Persistent record for every trade that fails a forensic sanity check.
+
+    One row per failed trade.  The ``forensic_json`` column stores the
+    full ``ForensicTrace`` payload for programmatic consumption by
+    dashboards, Slack bots, or compliance queries.
+    """
+
+    __tablename__ = "forensic_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Trade identity
+    trade_id = Column(Integer, nullable=False, index=True)
+    signal_id = Column(String(128), nullable=False, index=True)
+    symbol = Column(String(32), nullable=False)
+    desk_id = Column(Integer, nullable=False)
+    side = Column(String(8), nullable=False)
+
+    # Categorisation
+    severity = Column(
+        String(16), nullable=False, default="WARNING",
+        comment="CRITICAL | WARNING",
+    )
+    checks_failed = Column(
+        Text, nullable=False,
+        comment="Comma-separated check names: CAUSALITY_VIOLATION, "
+                "EXCESSIVE_SLIPPAGE, MISSING_APPROVAL_RECORD",
+    )
+
+    # Causality fields
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    execution_timestamp = Column(DateTime(timezone=True), nullable=True)
+    causality_delta_ms = Column(Integer, nullable=True)
+
+    # Slippage fields
+    signal_price = Column(Float, nullable=True)
+    fill_price = Column(Float, nullable=True)
+    slippage_abs = Column(Float, nullable=True)
+    atr_at_entry = Column(Float, nullable=True)
+    slippage_atr_ratio = Column(Float, nullable=True)
+
+    # Full trace
+    forensic_json = Column(
+        Text, nullable=False,
+        comment="Complete ForensicTrace JSON artifact",
+    )
+
+    # Workflow
+    reviewed = Column(
+        Integer, nullable=False, default=0,
+        comment="0 = pending review, 1 = acknowledged",
+    )
+
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
 
 # ---------------------------------------------------------------------------
 # ForensicTrace — immutable evidence container
@@ -155,6 +234,9 @@ _AUDIT_QUERY = text("""
 class SentinelAudit:
     """Forensic audit engine for post-trade integrity verification.
 
+    On first ``run_audit()`` the ``forensic_alerts`` table is
+    auto-created if it does not already exist.
+
     Parameters
     ----------
     postgres_url : str | None
@@ -174,9 +256,22 @@ class SentinelAudit:
     ) -> None:
         pg_url = (postgres_url or _DEFAULT_POSTGRES_URL).replace("+asyncpg", "")
         self._engine = create_engine(pg_url, pool_pre_ping=True, pool_size=3)
-        self._session_factory = sessionmaker(bind=self._engine)
+        self._session_factory = sessionmaker(
+            bind=self._engine, expire_on_commit=False,
+        )
         self._redis_url = redis_url or _DEFAULT_REDIS_URL
         self._artifact_dir = Path(artifact_dir)
+        self._table_ensured = False
+
+    # ----- table bootstrap --------------------------------------------------
+
+    def _ensure_table(self) -> None:
+        """Create ``forensic_alerts`` if it does not already exist."""
+        if self._table_ensured:
+            return
+        _Base.metadata.create_all(self._engine, tables=[ForensicAlert.__table__])
+        self._table_ensured = True
+        logger.debug("forensic_alerts table ensured")
 
     # ----- public API -------------------------------------------------------
 
@@ -185,6 +280,10 @@ class SentinelAudit:
         lookback_hours: int = _DEFAULT_LOOKBACK_HOURS,
     ) -> list[ForensicTrace]:
         """Execute causality + slippage checks and return failed traces.
+
+        Every failed trade is:
+        1. Exported as a JSON artifact to ``artifact_dir``.
+        2. Persisted to the ``forensic_alerts`` PostgreSQL table.
 
         Parameters
         ----------
@@ -197,6 +296,7 @@ class SentinelAudit:
         list[ForensicTrace]
             One trace per trade that violated at least one invariant.
         """
+        self._ensure_table()
         traces: list[ForensicTrace] = []
 
         with self._session_factory() as session:
@@ -216,6 +316,7 @@ class SentinelAudit:
             if failed is not None:
                 traces.append(failed)
                 self._export_artifact(failed)
+                self._persist_alert(failed)
 
         if traces:
             logger.warning(
@@ -248,8 +349,8 @@ class SentinelAudit:
             if causality_delta_ms <= 0:
                 checks_failed.append("CAUSALITY_VIOLATION")
                 logger.warning(
-                    "Causality violation: trade %d approved_at=%s >= execution_ts=%s "
-                    "(delta=%d ms)",
+                    "Causality violation: trade %d approved_at=%s >= "
+                    "execution_price_timestamp=%s (delta=%d ms)",
                     row.trade_id,
                     approved_at.isoformat(),
                     execution_ts.isoformat(),
@@ -281,8 +382,9 @@ class SentinelAudit:
             if slippage_atr_ratio > _SLIPPAGE_ATR_MULTIPLIER:
                 checks_failed.append("EXCESSIVE_SLIPPAGE")
                 logger.warning(
-                    "Slippage breach: trade %d signal=%.8f fill=%.8f "
-                    "slip=%.8f ATR=%.8f ratio=%.2f (limit=%.1f)",
+                    "Slippage breach: trade %d signal_price=%.8f "
+                    "fill_price=%.8f slip=%.8f ATR=%.8f ratio=%.2f "
+                    "(limit=%.1fx ATR)",
                     row.trade_id,
                     signal_price,
                     fill_price,
@@ -332,8 +434,9 @@ class SentinelAudit:
     def _extract_signal_price(hydrated_payload: str | None) -> float | None:
         """Best-effort extraction of ``signal_price`` from the JSON payload.
 
-        The hydrated payload written by ``claude_cto_dispatcher`` contains the
-        original webhook body under ``webhook.price`` or ``webhook.close``.
+        The hydrated payload written by ``claude_cto_dispatcher`` contains
+        the original webhook body under ``webhook.price`` or
+        ``webhook.close``.
         """
         if not hydrated_payload:
             return None
@@ -365,3 +468,63 @@ class SentinelAudit:
         path.write_text(trace.to_json(), encoding="utf-8")
         logger.info("Forensic artifact exported → %s", path)
         return path
+
+    # ----- database persistence ---------------------------------------------
+
+    def _persist_alert(self, trace: ForensicTrace) -> None:
+        """Insert a ``ForensicAlert`` row into the ``forensic_alerts`` table.
+
+        Parses ISO-8601 timestamp strings back into ``datetime`` objects
+        for native PostgreSQL ``TIMESTAMPTZ`` storage.
+        """
+        approved_dt: datetime | None = None
+        if trace.approved_at is not None:
+            try:
+                approved_dt = datetime.fromisoformat(trace.approved_at)
+            except ValueError:
+                pass
+
+        execution_dt: datetime | None = None
+        if trace.execution_timestamp is not None:
+            try:
+                execution_dt = datetime.fromisoformat(trace.execution_timestamp)
+            except ValueError:
+                pass
+
+        alert = ForensicAlert(
+            trade_id=trace.trade_id,
+            signal_id=trace.signal_id,
+            symbol=trace.symbol,
+            desk_id=trace.desk_id,
+            side=trace.side,
+            severity=trace.severity,
+            checks_failed=",".join(trace.checks_failed),
+            approved_at=approved_dt,
+            execution_timestamp=execution_dt,
+            causality_delta_ms=trace.causality_delta_ms,
+            signal_price=trace.signal_price,
+            fill_price=trace.fill_price,
+            slippage_abs=trace.slippage_abs,
+            atr_at_entry=trace.atr_at_entry,
+            slippage_atr_ratio=trace.slippage_atr_ratio,
+            forensic_json=trace.to_json(),
+            reviewed=0,
+        )
+
+        with self._session_factory() as session:
+            try:
+                session.add(alert)
+                session.commit()
+                logger.info(
+                    "Forensic alert persisted → forensic_alerts (trade_id=%d, "
+                    "severity=%s, checks=%s)",
+                    trace.trade_id,
+                    trace.severity,
+                    trace.checks_failed,
+                )
+            except Exception:
+                session.rollback()
+                logger.exception(
+                    "Failed to persist forensic alert for trade %d",
+                    trace.trade_id,
+                )
