@@ -4,6 +4,11 @@ Receives alerts from TradingView, deduplicates via Redis, checks the
 global volatility lock, hydrates the payload with desk state, and
 dispatches it to the ClaudeCTO agent for a Consensus Score evaluation.
 
+When the Consensus Score meets the execution threshold (>= 7.0) the
+router either executes immediately via a dynamic limit order or defers
+to the Redis pending-signal queue when a ``target_price`` has not yet
+been reached.
+
 All database operations flow through an ``AsyncSession`` injected via
 FastAPI ``Depends``.  Redis is accessed strictly through
 ``request.app.state.redis``.
@@ -30,6 +35,11 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from src.services.execution import (
+    ExecutionError,
+    OrderBroker,
+    execute_dynamic_limit_order,
+)
 from src.services.signal_hydration import HydrationError, hydrate_signal
 from src.services.telegram_broadcaster import broadcast_trade
 from src.strategies.desk1_scalping import Desk1ScalpingStrategy
@@ -47,6 +57,7 @@ POSTGRES_URL = os.getenv(
     "postgresql+asyncpg://user:password@localhost:5432/oniquant",
 )
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CONSENSUS_THRESHOLD: float = float(os.getenv("CONSENSUS_THRESHOLD", "7.0"))
 
 logger = logging.getLogger("oniquant.webhooks")
 
@@ -113,6 +124,9 @@ class WebhookPayload(BaseModel):
     desk_id: int = Field(default=1, ge=1, description="Target trading desk")
     price: float | None = Field(
         default=None, gt=0, description="Alert trigger price"
+    )
+    target_price: float | None = Field(
+        default=None, gt=0, description="Deferred execution target price"
     )
     timeframe: str | None = Field(default=None, description="Chart timeframe")
     message: str | None = Field(
@@ -228,7 +242,8 @@ async def tradingview_alert(
     4b. Strategy evaluation   — All 5 desks: OFI / Kalman / Lorentzian / Gold / CVD.
     5.  Signal hydration      — ``hydrate_signal(dict, dict) -> bytes``.
     6.  ClaudeCTO dispatch    — Consensus Score evaluation.
-    7.  Telegram broadcast    — fire-and-forget notification.
+    7.  Execution gate        — score >= 7.0: execute or defer to pending queue.
+    8.  Telegram broadcast    — fire-and-forget notification.
     """
     redis = request.app.state.redis
 
@@ -362,6 +377,7 @@ async def tradingview_alert(
             strategy = Desk5CryptoStrategy()
             result = strategy.evaluate(df, account_equity=account_equity)
             desk_state["cvd_zscore"] = result.cvd_zscore
+            desk_state["cvd_momentum"] = result.cvd_zscore
             desk_state["volatility_regime"] = result.volatility_regime
             desk_state["rsi"] = result.rsi
             desk_state["atr"] = result.atr
@@ -408,7 +424,88 @@ async def tradingview_alert(
     )
 
     # ------------------------------------------------------------------
-    # Stage 7 — Telegram broadcast (fire-and-forget)
+    # Stage 7 — Execution gate (consensus >= 7.0)
+    # ------------------------------------------------------------------
+    consensus_score = cto_result.get("consensus_score")
+    execution_receipt: dict[str, Any] | None = None
+
+    if (
+        consensus_score is not None
+        and isinstance(consensus_score, (int, float))
+        and consensus_score >= CONSENSUS_THRESHOLD
+    ):
+        signal_dict: dict = payload.model_dump()
+        signal_dict.update({
+            "desk_id": payload.desk_id,
+            "consensus_score": consensus_score,
+        })
+
+        # Check whether execution should be deferred to target_price.
+        current_price = payload.price
+        target_price = payload.target_price
+
+        if (
+            target_price is not None
+            and current_price is not None
+            and current_price < target_price
+        ):
+            # --- Defer: target not yet reached → enqueue in Redis ZSET ---
+            enqueued: bool = await redis.add_pending_signal(
+                payload=signal_dict,
+                target_price=target_price,
+            )
+            logger.info(
+                "Signal %s deferred to pending queue (target=%.4f, "
+                "current=%.4f, enqueued=%s)",
+                payload.signal_id,
+                target_price,
+                current_price,
+                enqueued,
+            )
+            execution_receipt = {
+                "status": "deferred",
+                "target_price": target_price,
+                "current_price": current_price,
+                "enqueued": enqueued,
+            }
+        else:
+            # --- Execute now: target met or no target specified -----------
+            broker: OrderBroker = request.app.state.broker
+            order_book: dict = await broker.get_order_book(payload.symbol)
+
+            try:
+                execution_receipt = await execute_dynamic_limit_order(
+                    signal=signal_dict,
+                    current_order_book=order_book,
+                    broker=broker,
+                    db=db,
+                )
+                logger.info(
+                    "Signal %s executed → %s @ %s (%d chase cycles)",
+                    payload.signal_id,
+                    execution_receipt.get("state"),
+                    execution_receipt.get("filled_price"),
+                    execution_receipt.get("chase_cycles", 0),
+                )
+            except ExecutionError as exc:
+                logger.error(
+                    "Execution failed for %s: %s", payload.signal_id, exc
+                )
+                execution_receipt = {
+                    "status": "execution_error",
+                    "detail": str(exc),
+                }
+    else:
+        logger.info(
+            "Signal %s below consensus threshold (score=%s, required>=%.1f) "
+            "— skipping execution",
+            payload.signal_id,
+            consensus_score,
+            CONSENSUS_THRESHOLD,
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 8 — Telegram broadcast (fire-and-forget)
     # ------------------------------------------------------------------
     await broadcast_trade(
         {
@@ -416,17 +513,21 @@ async def tradingview_alert(
             "action": payload.action,
             "symbol": payload.symbol,
             "price": payload.price,
-            "consensus_score": cto_result.get("consensus_score"),
+            "consensus_score": consensus_score,
         }
     )
 
+    response_content: dict[str, Any] = {
+        "status": "processed",
+        "signal_id": payload.signal_id,
+        "symbol": payload.symbol,
+        "action": payload.action,
+        "consensus": cto_result,
+    }
+    if execution_receipt is not None:
+        response_content["execution"] = execution_receipt
+
     return ORJSONResponse(
         status_code=status.HTTP_200_OK,
-        content={
-            "status": "processed",
-            "signal_id": payload.signal_id,
-            "symbol": payload.symbol,
-            "action": payload.action,
-            "consensus": cto_result,
-        },
+        content=response_content,
     )
