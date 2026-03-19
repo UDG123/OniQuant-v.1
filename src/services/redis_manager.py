@@ -1,3 +1,29 @@
+"""Async Redis state manager — atomic hot-swap, signal dedup, volatility locks.
+
+All strategy parameter mutations flow through server-side **Lua scripts**
+that execute as single atomic operations inside the Redis event loop.
+This eliminates TOCTOU race conditions that would arise from separate
+``HGET`` → ``HSET`` round-trips in a multi-writer environment (Celery
+workers, portfolio optimizer, champion-challenger orchestrator).
+
+Two atomic primitives are provided:
+
+* **CAS (Compare-And-Swap)** — ``_CAS_LUA`` reads the current
+  ``_version``, compares it against the caller's expected version, and
+  only writes if they match.  Stale writes are rejected with a ``0``
+  return code, forcing the caller to re-read and retry.
+
+* **Atomic Swap** — ``_ATOMIC_SWAP_LUA`` extends CAS with the
+  Shadow-Key / ``RENAME`` pattern: the new config is first staged in
+  a temporary hash (``tmp:desk:{id}:params``), then a single
+  ``RENAME`` atomically replaces the production key.  Readers never
+  observe a partial write because ``RENAME`` is an O(1) pointer swap.
+
+After every successful mutation a ``CONFIG_RESET`` message is published
+on the ``oniquant:config_reset`` Pub/Sub channel so all connected
+workers can invalidate their local in-process caches immediately.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,8 +40,9 @@ logger = logging.getLogger("oniquant.redis_manager")
 _PENDING_SIGNAL_TTL_SECONDS = 900
 _PENDING_QUEUE_KEY = "signals:pending"
 
-# Pub/Sub channel for strategy parameter updates.
+# Pub/Sub channels.
 _STRATEGY_UPDATE_CHANNEL = "oniquant:strategy_updates"
+_CONFIG_RESET_CHANNEL = "oniquant:config_reset"
 
 # Emergency halt — global circuit breaker.
 _EMERGENCY_HALT_CHANNEL = "oniquant:emergency_halt"
@@ -23,7 +50,7 @@ _VOLATILITY_LOCK_KEY = "global:volatility_lock"
 _EMERGENCY_HALT_TTL_SECONDS = 86_400  # 24 hours
 
 # ---------------------------------------------------------------------------
-# CAS Lua script — Compare-And-Swap for parameter versioning
+# Lua script 1 — Compare-And-Swap (in-place, no shadow key)
 # ---------------------------------------------------------------------------
 # KEYS[1] = active production key  (e.g. desk:1:params)
 # ARGV[1] = expected current version (integer, "0" to skip check)
@@ -31,33 +58,88 @@ _EMERGENCY_HALT_TTL_SECONDS = 86_400  # 24 hours
 # ARGV[3] = serialised new parameters (bytes)
 #
 # Returns:
-#   1  — swap succeeded
-#   0  — version mismatch (stale write rejected)
+#   {1, old_version}  — swap succeeded
+#   {0, current_ver}  — version mismatch (stale write rejected)
 # ---------------------------------------------------------------------------
-_CAS_LUA_SCRIPT = """
-local current_ver = redis.call('HGET', KEYS[1], '_version')
+_CAS_LUA = """
+local prod_key    = KEYS[1]
 local expected    = ARGV[1]
+local new_ver     = ARGV[2]
+local new_data    = ARGV[3]
 
--- If expected is "0" we skip the version check (initial write).
-if expected ~= "0" then
-    if current_ver == false then
-        -- Key does not exist yet — reject unless caller expects version 0.
-        return 0
-    end
-    if current_ver ~= expected then
-        return 0
-    end
+local current_ver = redis.call('HGET', prod_key, '_version')
+if current_ver == false then
+    current_ver = '0'
+end
+
+-- If expected is "0" we skip the version check (initial seed write).
+if expected ~= '0' and current_ver ~= expected then
+    return {0, current_ver}
 end
 
 -- Atomically overwrite the hash with new params + bumped version.
-redis.call('DEL', KEYS[1])
-redis.call('HSET', KEYS[1], '_version', ARGV[2], '_data', ARGV[3])
-return 1
+redis.call('DEL', prod_key)
+redis.call('HSET', prod_key, '_version', new_ver, '_data', new_data)
+return {1, current_ver}
+"""
+
+# ---------------------------------------------------------------------------
+# Lua script 2 — Atomic Swap via Shadow Key + RENAME + CAS
+# ---------------------------------------------------------------------------
+# KEYS[1] = production key       (e.g. desk:1:params)
+# KEYS[2] = shadow key           (e.g. tmp:desk:1:params)
+# ARGV[1] = expected version     (integer, "0" to force-write)
+# ARGV[2] = new version          (integer)
+# ARGV[3] = serialised new config (bytes)
+#
+# Flow executed atomically inside a single Lua invocation:
+#   1. Read _version from the production key.
+#   2. CAS: reject if current_ver != expected (unless expected == "0").
+#   3. Stage the new config into the shadow key.
+#   4. RENAME shadow → production (O(1) atomic pointer swap).
+#
+# Returns:
+#   {1, old_version}  — swap succeeded, production key updated
+#   {0, current_ver}  — version mismatch, production key untouched
+# ---------------------------------------------------------------------------
+_ATOMIC_SWAP_LUA = """
+local prod_key    = KEYS[1]
+local shadow_key  = KEYS[2]
+local expected    = ARGV[1]
+local new_ver     = ARGV[2]
+local new_data    = ARGV[3]
+
+-- Step 1: Read current version from production key.
+local current_ver = redis.call('HGET', prod_key, '_version')
+if current_ver == false then
+    current_ver = '0'
+end
+
+-- Step 2: CAS guard — reject stale writes.
+if expected ~= '0' and current_ver ~= expected then
+    return {0, current_ver}
+end
+
+-- Step 3: Stage new config in the shadow key.
+redis.call('DEL', shadow_key)
+redis.call('HSET', shadow_key, '_version', new_ver, '_data', new_data)
+
+-- Step 4: Atomic pointer swap — readers never see a partial state.
+redis.call('RENAME', shadow_key, prod_key)
+
+return {1, current_ver}
 """
 
 
 class RedisStateManager:
-    """Low-latency async Redis gateway for signal dedup, volatility locks, desk state, and atomic strategy hot-swap."""
+    """Low-latency async Redis gateway for signal dedup, volatility locks,
+    desk state, and atomic strategy hot-swap.
+
+    All parameter mutations use server-side Lua scripts pre-loaded via
+    ``SCRIPT LOAD`` at connect time, so subsequent calls use ``EVALSHA``
+    (a single network round-trip) rather than transmitting the full
+    script source on every invocation.
+    """
 
     def __init__(self, url: str | None = None, max_connections: int = 50):
         self._url = url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -65,6 +147,7 @@ class RedisStateManager:
         self._client: redis.Redis | None = None
         self._max_connections = max_connections
         self._cas_sha: str | None = None
+        self._atomic_swap_sha: str | None = None
 
     async def connect(self) -> None:
         self._pool = redis.ConnectionPool.from_url(
@@ -73,9 +156,10 @@ class RedisStateManager:
             decode_responses=False,
         )
         self._client = redis.Redis(connection_pool=self._pool)
-        # Pre-load the CAS Lua script into Redis so subsequent calls
+        # Pre-load both Lua scripts into Redis so subsequent calls
         # use EVALSHA (single round-trip) instead of EVAL.
-        self._cas_sha = await self._client.script_load(_CAS_LUA_SCRIPT)
+        self._cas_sha = await self._client.script_load(_CAS_LUA)
+        self._atomic_swap_sha = await self._client.script_load(_ATOMIC_SWAP_LUA)
 
     async def close(self) -> None:
         if self._client:
@@ -283,7 +367,153 @@ class RedisStateManager:
         return triggered
 
     # ------------------------------------------------------------------
-    # Atomic Strategy Hot-Swap
+    # Atomic Strategy Hot-Swap (Shadow Key + RENAME + Lua CAS)
+    # ------------------------------------------------------------------
+
+    async def atomic_swap_params(
+        self,
+        desk_id: int,
+        new_config: dict[str, Any],
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace desk configuration via Shadow Key + CAS + RENAME.
+
+        The entire read-compare-stage-swap sequence executes inside a
+        **single Lua script invocation**, eliminating the TOCTOU race
+        window that exists when version reads and shadow writes are
+        separate Redis commands.
+
+        Execution flow (all inside ``_ATOMIC_SWAP_LUA``):
+
+            1. **CAS guard** — read ``_version`` from the production key
+               (``desk:{id}:params``).  If *expected_version* is provided
+               and doesn't match, the swap is rejected immediately
+               (return code ``0``).
+            2. **Shadow staging** — write the new config to
+               ``tmp:desk:{id}:params`` so the production key is
+               untouched until the swap completes.
+            3. **Atomic RENAME** — ``RENAME tmp:desk:{id}:params
+               desk:{id}:params`` is an O(1) pointer swap; readers
+               never observe a partial write.
+
+        After a successful swap, two Pub/Sub messages are broadcast:
+
+        * ``STRATEGY_UPDATE`` on ``oniquant:strategy_updates`` — legacy
+          notification consumed by existing workers.
+        * ``CONFIG_RESET`` on ``oniquant:config_reset`` — explicit
+          cache-invalidation signal that tells all connected workers to
+          discard their in-process parameter caches for this desk.
+
+        Parameters
+        ----------
+        desk_id : int
+            Target trading desk (1–5).
+        new_config : dict[str, Any]
+            Full parameter / configuration set.  Must be JSON-serialisable.
+        expected_version : int | None
+            The version the caller believes is current.  When ``None``
+            the current version is read first (unconditional swap).
+            Pass an explicit version for strict optimistic concurrency.
+
+        Returns
+        -------
+        dict[str, Any]
+            Receipt with ``success``, ``desk_id``, ``version``,
+            ``previous_version``, ``subscribers_notified``, and the
+            echoed ``config``.
+
+        Raises
+        ------
+        RuntimeError
+            If the CAS check fails (version mismatch), indicating a
+            concurrent writer modified the config between the caller's
+            read and this swap attempt.
+        """
+        production_key = f"desk:{desk_id}:params"
+        shadow_key = f"tmp:desk:{desk_id}:params"
+        serialised = orjson.dumps(new_config, option=orjson.OPT_SORT_KEYS)
+
+        # Determine expected version.
+        if expected_version is None:
+            raw_ver = await self._client.hget(production_key, "_version")
+            expected_version = int(raw_ver) if raw_ver else 0
+
+        new_version = expected_version + 1 if expected_version > 0 else 1
+
+        # Execute the entire CAS + shadow + RENAME inside one Lua call.
+        result = await self._client.evalsha(
+            self._atomic_swap_sha,
+            2,                          # number of KEYS
+            production_key,
+            shadow_key,
+            str(expected_version),
+            str(new_version),
+            serialised,
+        )
+
+        success = int(result[0]) == 1
+        old_version = int(result[1])
+
+        if not success:
+            logger.warning(
+                "atomic_swap_params REJECTED: desk=%d expected=%d actual=%d "
+                "(concurrent writer detected)",
+                desk_id,
+                expected_version,
+                old_version,
+            )
+            raise RuntimeError(
+                f"CAS version mismatch for desk {desk_id}: "
+                f"expected {expected_version}, found {old_version}"
+            )
+
+        # --- Broadcast notifications in a single pipeline round-trip ------
+        update_payload = orjson.dumps({
+            "event": "STRATEGY_UPDATE",
+            "desk_id": desk_id,
+            "version": new_version,
+            "previous_version": old_version,
+            "config": new_config,
+            "swapped_at": time.time(),
+        })
+        reset_payload = orjson.dumps({
+            "event": "CONFIG_RESET",
+            "desk_id": desk_id,
+            "version": new_version,
+            "reason": "atomic_swap",
+            "invalidate_keys": [production_key],
+            "issued_at": time.time(),
+        })
+
+        pipe = self._client.pipeline(transaction=False)
+        pipe.publish(_STRATEGY_UPDATE_CHANNEL, update_payload)
+        pipe.publish(_CONFIG_RESET_CHANNEL, reset_payload)
+        pub_results = await pipe.execute()
+
+        update_subs = int(pub_results[0])
+        reset_subs = int(pub_results[1])
+
+        logger.info(
+            "atomic_swap_params OK: desk=%d version=%d→%d "
+            "strategy_subs=%d config_reset_subs=%d",
+            desk_id,
+            old_version,
+            new_version,
+            update_subs,
+            reset_subs,
+        )
+
+        return {
+            "success": True,
+            "desk_id": desk_id,
+            "version": new_version,
+            "previous_version": old_version,
+            "subscribers_notified": update_subs + reset_subs,
+            "config": new_config,
+        }
+
+    # ------------------------------------------------------------------
+    # Legacy hot-swap (delegates to atomic_swap_params)
     # ------------------------------------------------------------------
 
     async def hot_swap_strategy_params(
@@ -293,79 +523,37 @@ class RedisStateManager:
     ) -> dict[str, Any]:
         """Atomically replace strategy parameters for a desk.
 
-        Execution flow:
-            1. Write ``new_params`` to a shadow key
-               ``tmp:desk:{desk_id}:params`` so production is untouched
-               during the write.
-            2. ``RENAME`` the shadow key onto the active production key
-               ``desk:{desk_id}:params`` — this is an atomic O(1) pointer
-               swap inside Redis, so readers never see a partial update.
-            3. Publish a ``STRATEGY_UPDATE`` message on the
-               ``oniquant:strategy_updates`` Pub/Sub channel so all
-               connected workers can refresh their local memory cache
-               instantly.
+        Thin wrapper around :meth:`atomic_swap_params` that preserves
+        the original return-value shape for backward compatibility.
 
         Parameters
         ----------
         desk_id : int
             Target trading desk (1–5).
         new_params : dict[str, Any]
-            Full parameter set to install.  Must be JSON-serialisable.
+            Full parameter set to install.
 
         Returns
         -------
         dict[str, Any]
-            Receipt confirming the swap with ``desk_id``, ``version``,
-            and ``params`` echoed back.
+            Receipt confirming the swap.
         """
-        production_key = f"desk:{desk_id}:params"
-        shadow_key = f"tmp:desk:{desk_id}:params"
-
-        serialised = orjson.dumps(new_params, option=orjson.OPT_SORT_KEYS)
-
-        # Fetch the current version so we can bump it.
-        raw_version = await self._client.hget(production_key, "_version")
-        current_version = int(raw_version) if raw_version else 0
-        new_version = current_version + 1
-
-        # Step 1 — Write to shadow key.
-        await self._client.hset(
-            shadow_key,
-            mapping={
-                b"_version": str(new_version).encode(),
-                b"_data": serialised,
-            },
+        receipt = await self.atomic_swap_params(
+            desk_id=desk_id,
+            new_config=new_params,
+            expected_version=None,  # Unconditional swap.
         )
-
-        # Step 2 — Atomic rename (shadow → production).
-        await self._client.rename(shadow_key, production_key)
-
-        # Step 3 — Publish update notification on Pub/Sub.
-        notification = orjson.dumps({
-            "event": "STRATEGY_UPDATE",
-            "desk_id": desk_id,
-            "version": new_version,
-            "params": new_params,
-        })
-        subscriber_count = await self._client.publish(
-            _STRATEGY_UPDATE_CHANNEL, notification,
-        )
-
-        logger.info(
-            "Hot-swap complete: desk=%d version=%d→%d subscribers_notified=%d",
-            desk_id,
-            current_version,
-            new_version,
-            subscriber_count,
-        )
-
         return {
-            "desk_id": desk_id,
-            "version": new_version,
-            "previous_version": current_version,
-            "subscribers_notified": subscriber_count,
-            "params": new_params,
+            "desk_id": receipt["desk_id"],
+            "version": receipt["version"],
+            "previous_version": receipt["previous_version"],
+            "subscribers_notified": receipt["subscribers_notified"],
+            "params": receipt["config"],
         }
+
+    # ------------------------------------------------------------------
+    # CAS — strict optimistic concurrency
+    # ------------------------------------------------------------------
 
     async def cas_strategy_params(
         self,
@@ -375,8 +563,12 @@ class RedisStateManager:
     ) -> bool:
         """Compare-And-Swap: update parameters only if the version matches.
 
-        Uses a server-side Lua script so the read-compare-write is a
-        single atomic operation — no WATCH/MULTI required.
+        Uses the ``_CAS_LUA`` server-side Lua script so the entire
+        read-compare-write is a single atomic operation — no
+        ``WATCH`` / ``MULTI`` required.
+
+        On success, publishes both ``STRATEGY_UPDATE`` and
+        ``CONFIG_RESET`` to notify all workers to invalidate caches.
 
         Parameters
         ----------
@@ -407,28 +599,45 @@ class RedisStateManager:
             serialised,
         )
 
-        success = int(result) == 1
+        success = int(result[0]) == 1
+        old_version = int(result[1])
 
         if success:
-            # Broadcast on Pub/Sub after successful CAS.
-            notification = orjson.dumps({
+            # Broadcast both notifications in one pipeline.
+            update_payload = orjson.dumps({
                 "event": "STRATEGY_UPDATE",
                 "desk_id": desk_id,
                 "version": new_version,
                 "params": new_params,
             })
-            await self._client.publish(_STRATEGY_UPDATE_CHANNEL, notification)
+            reset_payload = orjson.dumps({
+                "event": "CONFIG_RESET",
+                "desk_id": desk_id,
+                "version": new_version,
+                "reason": "cas_swap",
+                "invalidate_keys": [production_key],
+                "issued_at": time.time(),
+            })
+            pipe = self._client.pipeline(transaction=False)
+            pipe.publish(_STRATEGY_UPDATE_CHANNEL, update_payload)
+            pipe.publish(_CONFIG_RESET_CHANNEL, reset_payload)
+            await pipe.execute()
+
             logger.info(
                 "CAS swap succeeded: desk=%d version=%d→%d",
-                desk_id, expected_version, new_version,
+                desk_id, old_version, new_version,
             )
         else:
             logger.warning(
-                "CAS swap rejected: desk=%d expected_version=%d (stale)",
-                desk_id, expected_version,
+                "CAS swap rejected: desk=%d expected=%d actual=%d (stale)",
+                desk_id, expected_version, old_version,
             )
 
         return success
+
+    # ------------------------------------------------------------------
+    # Parameter reads
+    # ------------------------------------------------------------------
 
     async def get_strategy_params(self, desk_id: int) -> tuple[int, dict[str, Any]]:
         """Read the current strategy parameters and version for a desk.
@@ -454,6 +663,10 @@ class RedisStateManager:
 
         return version, params
 
+    # ------------------------------------------------------------------
+    # Pub/Sub subscriptions
+    # ------------------------------------------------------------------
+
     async def subscribe_strategy_updates(self) -> redis.client.PubSub:
         """Return a Pub/Sub subscription for strategy update notifications.
 
@@ -467,6 +680,26 @@ class RedisStateManager:
         """
         pubsub = self._client.pubsub()
         await pubsub.subscribe(_STRATEGY_UPDATE_CHANNEL)
+        return pubsub
+
+    async def subscribe_config_reset(self) -> redis.client.PubSub:
+        """Return a Pub/Sub subscription for ``CONFIG_RESET`` events.
+
+        Workers should subscribe to this channel and discard any
+        in-process parameter caches for the ``desk_id`` specified in
+        the message payload.
+
+        Usage::
+
+            pubsub = await redis_manager.subscribe_config_reset()
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    event = orjson.loads(message["data"])
+                    desk_id = event["desk_id"]
+                    local_cache.pop(desk_id, None)
+        """
+        pubsub = self._client.pubsub()
+        await pubsub.subscribe(_CONFIG_RESET_CHANNEL)
         return pubsub
 
     async def purge_expired_signals(self) -> int:
