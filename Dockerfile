@@ -5,9 +5,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# System dependencies required by asyncpg and numpy.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 
-EXPOSE 8000
+# Non-root user for production safety.
+RUN addgroup --system app && adduser --system --ingroup app app
+USER app
