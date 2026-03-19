@@ -3,6 +3,10 @@
 Manages SIM_OPEN trades: fetches open positions, checks latest prices,
 applies trailing stop-loss logic, and closes breached positions.
 
+Also runs ``check_pending_orders`` on the same 15-second cadence to
+drain the Redis pending-signal queue and dispatch triggered signals to
+the dynamic limit-order execution engine.
+
 Start the worker + beat scheduler together:
     celery -A src.workers.trailing_stop worker --beat --loglevel=info
 
@@ -13,6 +17,7 @@ Or separately:
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 import os
@@ -35,6 +40,13 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from src.services.execution import (
+    ExecutionError,
+    OrderBroker,
+    execute_dynamic_limit_order,
+)
+from src.services.redis_manager import RedisStateManager
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -66,6 +78,10 @@ celery_app.conf.update(
     beat_schedule={
         "trailing-stop-check": {
             "task": "src.workers.trailing_stop.trailing_stop_sweep",
+            "schedule": 15.0,
+        },
+        "pending-orders-check": {
+            "task": "src.workers.trailing_stop.check_pending_orders_task",
             "schedule": 15.0,
         },
     },
@@ -208,8 +224,286 @@ def _fetch_latest_prices(symbols: list[str]) -> dict[str, Decimal]:
     return prices
 
 
+def _fetch_latest_price(symbol: str) -> float | None:
+    """Return the latest cached price for a single symbol, or ``None``."""
+    raw = _redis_client.get(f"{_PRICE_KEY_PREFIX}{symbol}")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid price value for %s: %r", symbol, raw)
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Core task
+# Order-book helper
+# ---------------------------------------------------------------------------
+
+
+def _fetch_order_book(symbol: str) -> dict[str, Any]:
+    """Build an order book snapshot from cached Redis price data.
+
+    Constructs best_bid / best_ask from the latest price with a
+    synthetic spread.  In production this would query a live L2 feed;
+    here we derive it from the cached price to keep the worker
+    self-contained.
+    """
+    price = _fetch_latest_price(symbol)
+    if price is None:
+        return {}
+
+    # Synthetic 2-bps spread centred on the last traded price.
+    half_spread = price * 0.0001
+    return {
+        "best_bid": round(price - half_spread, 8),
+        "best_ask": round(price + half_spread, 8),
+        "mid": price,
+        "symbol": symbol,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Async bridge — run coroutines from synchronous Celery tasks
+# ---------------------------------------------------------------------------
+
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """Return a reusable event loop for bridging async calls.
+
+    Celery workers are synchronous, but ``execute_dynamic_limit_order``
+    and ``RedisStateManager`` are async.  We maintain a single loop per
+    worker process to avoid the overhead of creating / tearing down
+    loops on every task invocation.
+    """
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+    return _event_loop
+
+
+def _run_async(coro: Any) -> Any:
+    """Execute an async coroutine from synchronous Celery context."""
+    loop = _get_or_create_event_loop()
+    return loop.run_until_complete(coro)
+
+
+# ---------------------------------------------------------------------------
+# Pending-orders async core
+# ---------------------------------------------------------------------------
+
+
+async def check_pending_orders(broker: OrderBroker) -> dict[str, Any]:
+    """Fetch triggered pending signals from Redis and execute them.
+
+    Steps
+    -----
+    1. Read the live market price from the Redis price cache.
+    2. Query the pending-signal ZSET via
+       ``RedisStateManager.get_triggered_signals(current_price)``.
+    3. For each triggered signal, build an order-book snapshot and
+       dispatch to ``execute_dynamic_limit_order()``.
+
+    Parameters
+    ----------
+    broker : OrderBroker
+        Exchange adapter to forward orders to.
+
+    Returns
+    -------
+    dict
+        Summary with ``triggered``, ``executed``, and ``errors`` counts.
+    """
+    redis_mgr = RedisStateManager(url=REDIS_URL)
+    await redis_mgr.connect()
+
+    triggered_count = 0
+    executed_count = 0
+    error_count = 0
+
+    try:
+        # Collect all unique symbols from the pending queue so we can
+        # check each price level.  We scan a broad price range by using
+        # a generous current_price to surface everything that is ready.
+        #
+        # Strategy: read prices for common symbols and check triggers.
+        # The ZSET scores are target prices — we query with each
+        # symbol's live price to find signals whose target has been hit.
+
+        # Fetch all signals whose target_price <= current market price.
+        # We iterate known price keys to cover every symbol that has
+        # pending signals.
+        all_price_keys: list[str] = []
+        cursor: int = 0
+        while True:
+            cursor, keys = _redis_client.scan(
+                cursor=cursor, match=f"{_PRICE_KEY_PREFIX}*", count=200
+            )
+            all_price_keys.extend(keys)
+            if cursor == 0:
+                break
+
+        if not all_price_keys:
+            logger.debug("No cached prices — skipping pending-order check")
+            return {"triggered": 0, "executed": 0, "errors": 0}
+
+        # Determine the highest live price across all symbols so we
+        # capture every pending signal whose target has been breached.
+        max_price: float = 0.0
+        symbol_prices: dict[str, float] = {}
+        for key in all_price_keys:
+            # key is e.g. "price:latest:XAUUSD"
+            sym = key.replace(_PRICE_KEY_PREFIX, "")
+            raw = _redis_client.get(key)
+            if raw is None:
+                continue
+            try:
+                p = float(raw)
+                symbol_prices[sym] = p
+                if p > max_price:
+                    max_price = p
+            except (ValueError, TypeError):
+                continue
+
+        if max_price <= 0:
+            return {"triggered": 0, "executed": 0, "errors": 0}
+
+        # Pull every signal whose target_price <= max_price.
+        triggered_signals: list[dict] = await redis_mgr.get_triggered_signals(
+            current_price=max_price,
+        )
+
+        if not triggered_signals:
+            logger.debug("No pending signals triggered at price %.4f", max_price)
+            return {"triggered": 0, "executed": 0, "errors": 0}
+
+        triggered_count = len(triggered_signals)
+        logger.info(
+            "%d pending signal(s) triggered (max_price=%.4f)",
+            triggered_count,
+            max_price,
+        )
+
+        # Fire executions concurrently for all triggered signals.
+        tasks: list[asyncio.Task] = []
+        for sig in triggered_signals:
+            symbol = sig.get("symbol", "")
+            if not symbol:
+                error_count += 1
+                logger.warning("Triggered signal missing symbol: %s", sig)
+                continue
+
+            # Use the symbol-specific live price for the order book.
+            live_price = symbol_prices.get(symbol)
+            if live_price is None:
+                error_count += 1
+                logger.warning(
+                    "No live price for triggered signal symbol %s", symbol
+                )
+                continue
+
+            half_spread = live_price * 0.0001
+            order_book = {
+                "best_bid": round(live_price - half_spread, 8),
+                "best_ask": round(live_price + half_spread, 8),
+                "mid": live_price,
+                "symbol": symbol,
+            }
+
+            task = asyncio.create_task(
+                _execute_single_signal(sig, order_book, broker)
+            )
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                error_count += 1
+                logger.error("Execution failed for triggered signal: %s", result)
+            else:
+                executed_count += 1
+
+    finally:
+        await redis_mgr.close()
+
+    summary = {
+        "triggered": triggered_count,
+        "executed": executed_count,
+        "errors": error_count,
+    }
+    logger.info("Pending-order check complete: %s", summary)
+    return summary
+
+
+async def _execute_single_signal(
+    sig: dict[str, Any],
+    order_book: dict[str, Any],
+    broker: OrderBroker,
+) -> dict[str, Any]:
+    """Execute a single triggered signal through the limit-order engine.
+
+    Wraps ``execute_dynamic_limit_order`` with per-signal error handling
+    so one failure does not abort the entire batch.
+    """
+    symbol = sig.get("symbol", "UNKNOWN")
+    signal_id = sig.get("signal_id", "UNKNOWN")
+
+    logger.info(
+        "Executing triggered signal %s for %s", signal_id, symbol
+    )
+
+    try:
+        receipt = await execute_dynamic_limit_order(
+            signal=sig,
+            current_order_book=order_book,
+            broker=broker,
+        )
+        logger.info(
+            "Signal %s executed → %s (filled @ %s, %d chase cycles)",
+            signal_id,
+            receipt.get("state"),
+            receipt.get("filled_price"),
+            receipt.get("chase_cycles", 0),
+        )
+        return receipt
+    except ExecutionError as exc:
+        logger.error(
+            "ExecutionError for signal %s (%s): %s", signal_id, symbol, exc
+        )
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Stub broker for pending-order dispatch
+# ---------------------------------------------------------------------------
+
+# In production, replace ``_default_broker`` with a real exchange adapter
+# that satisfies the ``OrderBroker`` protocol (e.g. Binance, Bybit, IBKR).
+
+_default_broker: OrderBroker | None = None
+
+
+def set_default_broker(broker: OrderBroker) -> None:
+    """Register the exchange adapter used by the pending-order worker task."""
+    global _default_broker
+    _default_broker = broker
+
+
+def _get_broker() -> OrderBroker:
+    """Return the configured broker, or raise if none is registered."""
+    if _default_broker is None:
+        raise RuntimeError(
+            "No OrderBroker registered. Call set_default_broker() at worker "
+            "startup or configure an exchange adapter."
+        )
+    return _default_broker
+
+
+# ---------------------------------------------------------------------------
+# Core tasks
 # ---------------------------------------------------------------------------
 
 @celery_app.task(
@@ -321,3 +615,37 @@ def trailing_stop_sweep(self) -> dict[str, Any]:
         raise self.retry(exc=exc)
     finally:
         db.close()
+
+
+@celery_app.task(
+    name="src.workers.trailing_stop.check_pending_orders_task",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=5,
+)
+def check_pending_orders_task(self) -> dict[str, Any]:
+    """Celery task: drain triggered pending signals and execute them.
+
+    Bridges the async ``check_pending_orders()`` coroutine into the
+    synchronous Celery worker via a dedicated event loop.
+
+    Runs on the same 15-second Beat cadence as the trailing-stop sweep.
+    """
+    if _shutting_down:
+        return {"skipped": True, "reason": "worker_shutting_down"}
+
+    try:
+        broker = _get_broker()
+    except RuntimeError:
+        logger.warning(
+            "No broker configured — skipping pending-order check. "
+            "Call set_default_broker() at worker init."
+        )
+        return {"skipped": True, "reason": "no_broker"}
+
+    try:
+        result = _run_async(check_pending_orders(broker))
+        return result
+    except Exception as exc:
+        logger.exception("Pending-order check failed")
+        raise self.retry(exc=exc)
