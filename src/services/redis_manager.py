@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import os
+import time
 
 import orjson
 import redis.asyncio as redis
+
+# Pending signals expire after 15 minutes (900 seconds).
+_PENDING_SIGNAL_TTL_SECONDS = 900
+_PENDING_QUEUE_KEY = "signals:pending"
 
 
 class RedisStateManager:
@@ -53,6 +58,119 @@ class RedisStateManager:
             f"desk:{desk_id}:state"
         )
         return {k.decode(): _try_deserialize(v) for k, v in raw.items()}
+
+    # ------------------------------------------------------------------
+    # Pending Signal Queue (ZSET — score = target_price)
+    # ------------------------------------------------------------------
+
+    async def add_pending_signal(
+        self,
+        payload: dict,
+        target_price: float,
+    ) -> bool:
+        """Enqueue a signal that should trigger when *target_price* is hit.
+
+        The payload is stored as a ZSET member with the target price as
+        the score.  A ``expires_at`` epoch timestamp (now + 15 min) is
+        injected into the payload so consumers can discard stale entries.
+
+        Parameters
+        ----------
+        payload : dict
+            Webhook payload (must be JSON-serialisable via orjson).
+        target_price : float
+            The price level that activates this signal.
+
+        Returns
+        -------
+        bool
+            ``True`` if the signal was newly added, ``False`` if it was
+            already present (duplicate member in the ZSET).
+        """
+        enriched = {
+            **payload,
+            "target_price": target_price,
+            "queued_at": time.time(),
+            "expires_at": time.time() + _PENDING_SIGNAL_TTL_SECONDS,
+        }
+        member = orjson.dumps(enriched, option=orjson.OPT_SORT_KEYS)
+        added: int = await self._client.zadd(
+            _PENDING_QUEUE_KEY, {member: target_price}
+        )
+        return added > 0
+
+    async def get_triggered_signals(
+        self,
+        current_price: float,
+    ) -> list[dict]:
+        """Fetch and atomically remove all signals whose target price has been crossed.
+
+        Retrieves every ZSET member with ``score <= current_price``,
+        removes them in a single pipeline round-trip, deserialises each
+        member, and drops any that have exceeded their 15-minute TTL.
+
+        Parameters
+        ----------
+        current_price : float
+            The latest market price to compare against stored targets.
+
+        Returns
+        -------
+        list[dict]
+            Triggered (and still fresh) signal payloads.
+        """
+        # Atomic fetch + remove via a pipeline to prevent double-firing.
+        pipe = self._client.pipeline(transaction=True)
+        pipe.zrangebyscore(_PENDING_QUEUE_KEY, "-inf", current_price)
+        pipe.zremrangebyscore(_PENDING_QUEUE_KEY, "-inf", current_price)
+        results = await pipe.execute()
+
+        raw_members: list[bytes] = results[0]
+        now = time.time()
+        triggered: list[dict] = []
+
+        for member in raw_members:
+            try:
+                data: dict = orjson.loads(member)
+            except (orjson.JSONDecodeError, ValueError):
+                continue
+            # Drop stale signals that outlived their 15-minute window.
+            if data.get("expires_at", 0) < now:
+                continue
+            triggered.append(data)
+
+        return triggered
+
+    async def purge_expired_signals(self) -> int:
+        """Remove all pending signals whose 15-minute TTL has elapsed.
+
+        Scans the full ZSET and drops expired members.  Intended to be
+        called from a periodic background task so the queue stays lean.
+
+        Returns
+        -------
+        int
+            Number of expired members removed.
+        """
+        all_members: list[bytes] = await self._client.zrangebyscore(
+            _PENDING_QUEUE_KEY, "-inf", "+inf"
+        )
+        now = time.time()
+        expired: list[bytes] = []
+
+        for member in all_members:
+            try:
+                data = orjson.loads(member)
+            except (orjson.JSONDecodeError, ValueError):
+                expired.append(member)
+                continue
+            if data.get("expires_at", 0) < now:
+                expired.append(member)
+
+        if expired:
+            await self._client.zrem(_PENDING_QUEUE_KEY, *expired)
+
+        return len(expired)
 
 
 def _try_deserialize(value: bytes):
