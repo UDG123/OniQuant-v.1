@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+import orjson
 from sqlalchemy import (
     Column,
     DateTime,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    select,
     update,
 )
 from sqlalchemy.ext.asyncio import (
@@ -38,7 +40,14 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from src.services.redis_manager import RedisStateManager
+
 logger = logging.getLogger("oniquant.execution")
+
+# ---------------------------------------------------------------------------
+# Module-level emergency halt flag
+# ---------------------------------------------------------------------------
+_halt_active: bool = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -267,6 +276,12 @@ async def execute_dynamic_limit_order(
     ExecutionError
         On missing fields, invalid order-book data, or broker failures.
     """
+    # --- Emergency halt gate -----------------------------------------------
+    if _halt_active:
+        raise ExecutionError(
+            "Emergency halt is active — all new executions are blocked"
+        )
+
     # --- Validate inputs --------------------------------------------------
     signal_id: str = signal.get("signal_id", "")
     symbol: str = signal.get("symbol", "")
@@ -402,9 +417,164 @@ async def _wait_for_fill(
     """
     elapsed = 0.0
     while elapsed < timeout:
+        if _halt_active:
+            return None
         status: OrderStatus = await broker.get_order_status(order_id)
         if status.is_filled:
             return status.filled_price
         await asyncio.sleep(_POLL_INTERVAL)
         elapsed += _POLL_INTERVAL
     return None
+
+
+# ---------------------------------------------------------------------------
+# Emergency halt — cancel all pending limit orders
+# ---------------------------------------------------------------------------
+
+
+async def cancel_all_pending_orders(
+    broker: OrderBroker,
+    db: AsyncSession | None = None,
+) -> dict[str, Any]:
+    """Cancel every trade in PENDING state and mark it CANCELLED.
+
+    Called by the emergency-halt Pub/Sub listener to immediately abort
+    all in-flight limit orders.
+
+    Returns
+    -------
+    dict
+        Summary with ``cancelled`` count and ``errors`` count.
+    """
+    own_session = db is None
+    if own_session:
+        db = _session_factory()
+
+    cancelled = 0
+    errors = 0
+
+    try:
+        result = await db.execute(
+            select(TradeRecord).where(
+                TradeRecord.state == TradeState.PENDING.value,
+            )
+        )
+        pending_trades: list[TradeRecord] = list(result.scalars().all())
+
+        if not pending_trades:
+            logger.info("Emergency halt: no PENDING orders to cancel")
+            return {"cancelled": 0, "errors": 0}
+
+        logger.warning(
+            "Emergency halt: cancelling %d PENDING orders", len(pending_trades)
+        )
+
+        now = datetime.now(timezone.utc)
+        for trade in pending_trades:
+            try:
+                if trade.broker_order_id:
+                    await broker.cancel_order(trade.broker_order_id)
+                await db.execute(
+                    update(TradeRecord)
+                    .where(TradeRecord.id == trade.id)
+                    .values(
+                        state=TradeState.CANCELLED.value,
+                        updated_at=now,
+                    )
+                )
+                cancelled += 1
+                logger.info(
+                    "Emergency halt: cancelled order %s (broker=%s)",
+                    trade.trade_id,
+                    trade.broker_order_id,
+                )
+            except Exception:
+                errors += 1
+                logger.exception(
+                    "Emergency halt: failed to cancel order %s",
+                    trade.trade_id,
+                )
+
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Emergency halt: cancel_all_pending_orders failed")
+        raise
+    finally:
+        if own_session:
+            await db.close()
+
+    summary = {"cancelled": cancelled, "errors": errors}
+    logger.warning("Emergency halt cancel complete: %s", summary)
+    return summary
+
+
+async def listen_for_emergency_halt(
+    redis_url: str | None = None,
+    broker: OrderBroker | None = None,
+) -> None:
+    """Long-running coroutine that listens for EMERGENCY_HALT events.
+
+    When a halt message arrives on the ``oniquant:emergency_halt``
+    Pub/Sub channel, this listener:
+
+    1. Sets the module-level ``_halt_active`` flag to block new orders.
+    2. Calls ``cancel_all_pending_orders()`` to abort in-flight orders.
+
+    When a ``HALT_LIFTED`` message arrives, the flag is cleared.
+
+    Intended to be launched as a background task during the FastAPI
+    lifespan or similar startup hook::
+
+        asyncio.create_task(listen_for_emergency_halt(broker=my_broker))
+    """
+    global _halt_active
+
+    redis_mgr = RedisStateManager(url=redis_url)
+    await redis_mgr.connect()
+
+    # Sync flag with existing Redis state on startup.
+    _halt_active = await redis_mgr.is_emergency_halt_active()
+    if _halt_active:
+        logger.warning(
+            "Emergency halt already active on startup — blocking new orders"
+        )
+
+    try:
+        pubsub = await redis_mgr.subscribe_emergency_halt()
+        logger.info("Emergency halt listener started on Pub/Sub channel")
+
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            try:
+                event = orjson.loads(message["data"])
+            except (orjson.JSONDecodeError, ValueError):
+                logger.warning(
+                    "Malformed emergency halt message: %r", message["data"]
+                )
+                continue
+
+            event_type = event.get("event")
+
+            if event_type == "EMERGENCY_HALT":
+                _halt_active = True
+                logger.warning(
+                    "EMERGENCY HALT received — reason: %s", event.get("reason")
+                )
+
+                if broker is not None:
+                    try:
+                        await cancel_all_pending_orders(broker)
+                    except Exception:
+                        logger.exception(
+                            "Failed to cancel pending orders during halt"
+                        )
+
+            elif event_type == "HALT_LIFTED":
+                _halt_active = False
+                logger.info("Emergency halt lifted — resuming normal operation")
+
+    finally:
+        await redis_mgr.close()

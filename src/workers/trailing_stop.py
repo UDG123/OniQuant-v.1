@@ -41,12 +41,17 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+import orjson
+
 from src.services.execution import (
     ExecutionError,
     OrderBroker,
     execute_dynamic_limit_order,
 )
-from src.services.redis_manager import RedisStateManager
+from src.services.redis_manager import (
+    RedisStateManager,
+    _EMERGENCY_HALT_CHANNEL,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -193,6 +198,130 @@ def _on_worker_shutting_down(sig: str = "", how: str = "", **kwargs: Any) -> Non
     """Celery signal fired just before the worker exits."""
     logger.info("Celery worker_shutting_down (sig=%s, how=%s)", sig, how)
     _flush_pending_updates()
+
+
+# ---------------------------------------------------------------------------
+# Emergency halt state + listener
+# ---------------------------------------------------------------------------
+
+_halt_active = False
+
+
+def _emergency_close_all_positions() -> dict[str, Any]:
+    """Close every SIM_OPEN position at the current market price.
+
+    Called when an EMERGENCY_HALT event is received on the Pub/Sub
+    channel.  Each trade is marked SIM_CLOSED with its current cached
+    price as the close_price.
+    """
+    db: Session = _SessionLocal()
+    closed_count = 0
+    try:
+        open_trades: list[SimTrade] = (
+            db.query(SimTrade)
+            .filter(SimTrade.status == "SIM_OPEN")
+            .all()
+        )
+
+        if not open_trades:
+            logger.info("Emergency halt: no SIM_OPEN positions to close")
+            return {"closed": 0}
+
+        symbols = list({t.symbol for t in open_trades})
+        prices = _fetch_latest_prices(symbols)
+        now = datetime.now(timezone.utc)
+
+        for trade in open_trades:
+            close_price = prices.get(trade.symbol) or Decimal(str(trade.entry_price))
+            db.execute(
+                update(SimTrade)
+                .where(SimTrade.id == trade.id)
+                .values(
+                    status="SIM_CLOSED",
+                    closed_at=now,
+                    close_price=close_price,
+                )
+            )
+            closed_count += 1
+            logger.warning(
+                "Emergency halt: CLOSED trade %d (%s) at %s",
+                trade.id,
+                trade.symbol,
+                close_price,
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Emergency halt: failed to close positions")
+    finally:
+        db.close()
+
+    logger.warning("Emergency halt: force-closed %d positions", closed_count)
+    return {"closed": closed_count}
+
+
+def _start_halt_listener() -> None:
+    """Launch a background thread that subscribes to emergency halt events.
+
+    Uses the synchronous ``redis`` client (same as the rest of this
+    worker) to listen on the ``oniquant:emergency_halt`` Pub/Sub
+    channel.  When an ``EMERGENCY_HALT`` event arrives it:
+
+    1. Sets the module-level ``_halt_active`` flag so new sweeps abort.
+    2. Calls ``_emergency_close_all_positions()`` to liquidate.
+
+    When ``HALT_LIFTED`` arrives, the flag is cleared.
+    """
+    import threading
+
+    def _listener() -> None:
+        global _halt_active
+        pubsub = _redis_client.pubsub()
+        pubsub.subscribe(_EMERGENCY_HALT_CHANNEL)
+        logger.info("Emergency halt Pub/Sub listener started (thread)")
+
+        # Check if halt is already active at startup.
+        current = _redis_client.get("global:volatility_lock")
+        if current == "HALT":
+            _halt_active = True
+            logger.warning(
+                "Emergency halt already active on worker startup"
+            )
+
+        for message in pubsub.listen():
+            if _shutting_down:
+                break
+            if message["type"] != "message":
+                continue
+            try:
+                event = orjson.loads(message["data"])
+            except (orjson.JSONDecodeError, ValueError):
+                continue
+
+            event_type = event.get("event")
+
+            if event_type == "EMERGENCY_HALT":
+                _halt_active = True
+                logger.warning(
+                    "EMERGENCY HALT received in worker — reason: %s",
+                    event.get("reason"),
+                )
+                _emergency_close_all_positions()
+
+            elif event_type == "HALT_LIFTED":
+                _halt_active = False
+                logger.info(
+                    "Emergency halt lifted — worker resuming normal operation"
+                )
+
+        pubsub.close()
+
+    t = threading.Thread(target=_listener, daemon=True, name="halt-listener")
+    t.start()
+
+
+_start_halt_listener()
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +653,9 @@ def trailing_stop_sweep(self) -> dict[str, Any]:
     if _shutting_down:
         return {"skipped": True, "reason": "worker_shutting_down"}
 
+    if _halt_active:
+        return {"skipped": True, "reason": "emergency_halt_active"}
+
     db: Session = _SessionLocal()
     try:
         open_trades: list[SimTrade] = (
@@ -633,6 +765,9 @@ def check_pending_orders_task(self) -> dict[str, Any]:
     """
     if _shutting_down:
         return {"skipped": True, "reason": "worker_shutting_down"}
+
+    if _halt_active:
+        return {"skipped": True, "reason": "emergency_halt_active"}
 
     try:
         broker = _get_broker()

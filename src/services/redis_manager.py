@@ -17,6 +17,11 @@ _PENDING_QUEUE_KEY = "signals:pending"
 # Pub/Sub channel for strategy parameter updates.
 _STRATEGY_UPDATE_CHANNEL = "oniquant:strategy_updates"
 
+# Emergency halt — global circuit breaker.
+_EMERGENCY_HALT_CHANNEL = "oniquant:emergency_halt"
+_VOLATILITY_LOCK_KEY = "global:volatility_lock"
+_EMERGENCY_HALT_TTL_SECONDS = 86_400  # 24 hours
+
 # ---------------------------------------------------------------------------
 # CAS Lua script — Compare-And-Swap for parameter versioning
 # ---------------------------------------------------------------------------
@@ -92,9 +97,101 @@ class RedisStateManager:
         return result is not None
 
     async def is_volatility_lock_active(self) -> bool:
-        """Return True when the global volatility lock is engaged."""
-        value = await self._client.get("global:volatility_lock")
-        return value is not None
+        """Return True when the global volatility lock is engaged.
+
+        The lock is active when the key exists with value ``b"TRUE"``
+        (standard volatility lock) **or** ``b"HALT"`` (emergency halt).
+        """
+        value = await self._client.get(_VOLATILITY_LOCK_KEY)
+        if value is None:
+            return False
+        return value in (b"TRUE", b"HALT", "TRUE", "HALT")
+
+    async def is_emergency_halt_active(self) -> bool:
+        """Return True only when the emergency halt state is engaged."""
+        value = await self._client.get(_VOLATILITY_LOCK_KEY)
+        if value is None:
+            return False
+        return value in (b"HALT", "HALT")
+
+    async def activate_emergency_halt(self, reason: str) -> int:
+        """Activate the global emergency halt.
+
+        Sets ``global:volatility_lock`` to ``HALT`` with a 24-hour TTL
+        and publishes the halt event on the ``oniquant:emergency_halt``
+        Pub/Sub channel so all connected services can react immediately.
+
+        Parameters
+        ----------
+        reason : str
+            Human-readable explanation for the halt (persisted in the
+            Pub/Sub message for audit logging).
+
+        Returns
+        -------
+        int
+            Number of Pub/Sub subscribers that received the halt message.
+        """
+        pipe = self._client.pipeline(transaction=True)
+        pipe.set(
+            _VOLATILITY_LOCK_KEY,
+            "HALT",
+            ex=_EMERGENCY_HALT_TTL_SECONDS,
+        )
+        halt_payload = orjson.dumps({
+            "event": "EMERGENCY_HALT",
+            "reason": reason,
+            "ttl_seconds": _EMERGENCY_HALT_TTL_SECONDS,
+            "issued_at": time.time(),
+        })
+        pipe.publish(_EMERGENCY_HALT_CHANNEL, halt_payload)
+        results = await pipe.execute()
+
+        subscriber_count: int = results[1]
+        logger.warning(
+            "EMERGENCY HALT activated — reason=%r ttl=%ds subscribers=%d",
+            reason,
+            _EMERGENCY_HALT_TTL_SECONDS,
+            subscriber_count,
+        )
+        return subscriber_count
+
+    async def deactivate_emergency_halt(self) -> bool:
+        """Clear the emergency halt, restoring normal operation.
+
+        Returns
+        -------
+        bool
+            ``True`` if the key was present and deleted.
+        """
+        deleted: int = await self._client.delete(_VOLATILITY_LOCK_KEY)
+        if deleted:
+            logger.info("Emergency halt deactivated — normal operation resumed")
+            # Notify subscribers that the halt has been lifted.
+            await self._client.publish(
+                _EMERGENCY_HALT_CHANNEL,
+                orjson.dumps({
+                    "event": "HALT_LIFTED",
+                    "lifted_at": time.time(),
+                }),
+            )
+        return deleted > 0
+
+    async def subscribe_emergency_halt(self) -> redis.client.PubSub:
+        """Return a Pub/Sub subscription for emergency halt events.
+
+        Usage::
+
+            pubsub = await redis_manager.subscribe_emergency_halt()
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    event = orjson.loads(message["data"])
+                    if event["event"] == "EMERGENCY_HALT":
+                        # cancel orders, close positions, etc.
+        """
+        pubsub = self._client.pubsub()
+        await pubsub.subscribe(_EMERGENCY_HALT_CHANNEL)
+        return pubsub
 
     async def get_desk_state(self, desk_id: int) -> dict:
         """Retrieve the full state hash for a trading desk."""
