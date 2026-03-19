@@ -1,0 +1,89 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile",
+    "watchPatterns": [
+      "src/strategies/**",
+      "src/core/**",
+      "src/services/**",
+      "src/api/**",
+      "src/workers/**",
+      "src/main.py",
+      "src/mcp_trading_server.py",
+      "requirements.txt",
+      "Dockerfile",
+      "railway.json"
+    ]
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  },
+  "services": {
+    "OniQuant-API": {
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "src/strategies/**",
+          "src/core/**",
+          "src/services/**",
+          "src/api/**",
+          "src/main.py",
+          "requirements.txt",
+          "Dockerfile"
+        ]
+      },
+      "deploy": {
+        "startCommand": "uvicorn src.main:app --host 0.0.0.0 --port $PORT",
+        "healthcheckPath": "/health",
+        "healthcheckTimeout": 10,
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 5
+      }
+    },
+    "OniQuant-Worker": {
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "src/strategies/**",
+          "src/core/**",
+          "src/services/**",
+          "src/workers/**",
+          "requirements.txt",
+          "Dockerfile"
+        ]
+      },
+      "deploy": {
+        "startCommand": "celery -A src.workers.trailing_stop worker --beat --loglevel=info",
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 5
+      }
+    },
+    "OniQuant-MCP": {
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "src/strategies/**",
+          "src/core/**",
+          "src/services/**",
+          "src/mcp_trading_server.py",
+          "requirements.txt",
+          "Dockerfile"
+        ]
+      },
+      "deploy": {
+        "startCommand": "python src/mcp_trading_server.py",
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 5
+      }
+    }
+  }
+}
