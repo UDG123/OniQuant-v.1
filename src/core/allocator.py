@@ -1,22 +1,27 @@
 """Dynamic Fractional Kelly Criterion capital allocator.
 
-Periodically fetches the 7-day trailing win rate and profit factor for
-each of the five trading desks from the ``trade_log`` PostgreSQL table,
-computes the optimal Kelly fraction, and tempers it with a configurable
-fractional factor (default 0.25) to prevent drawdown spikes.
-
-The output is a ``SizeRecommendation`` JSON-serialisable object that
-the execution service (``src.services.execution``) consumes to set the
-``quantity`` field on new orders.
+Periodically fetches the 7-day trailing win rate (*p*) and average
+payout ratio (*b* = avg_win / avg_loss) for each of the five trading
+desks from the ``trade_log`` PostgreSQL table, computes the optimal
+Kelly fraction, and tempers it with a configurable fractional factor
+(default 0.25) to protect against parameter mis-estimation.
 
 Kelly formula::
 
-    f* = (p · b − q) / b
+    f* = (p · b − (1 − p)) / b
 
 where:
-    p = win probability (trailing win rate)
-    b = payout ratio   (avg win / avg loss)
-    q = 1 − p          (loss probability)
+    p = win probability  (7-day trailing win rate)
+    b = payout ratio     (avg winning pnl / avg losing pnl)
+
+The 0.25 × f* fractional dampener converts the theoretical optimum
+into a conservative real-world allocation that limits drawdown risk
+from sampling noise in the trailing window.
+
+After computing the ``SizeRecommendation`` for each desk, the service
+writes it directly into the ``desk:{id}:state`` Redis hash so the
+execution engine (``src.services.execution``) reads the ``kelly_size``
+field at order-placement time and sets the trade ``quantity``.
 
 Usage — standalone::
 
@@ -30,11 +35,11 @@ Usage — single desk before order placement::
     rec = allocator.compute(desk_id=3, account_equity=100_000.0)
     signal["quantity"] = rec.position_size
 
-Usage — Celery beat (periodic refresh)::
+Usage — Celery beat (periodic refresh + desk_state update)::
 
     from src.core.allocator import KellyAllocator
     allocator = KellyAllocator()
-    allocator.refresh_and_cache()  # writes to Redis
+    allocator.refresh_and_cache()  # writes to Redis desk state + kelly keys
 """
 
 from __future__ import annotations
@@ -89,16 +94,29 @@ logger = logging.getLogger("oniquant.core.allocator")
 
 @dataclass(slots=True, frozen=True)
 class DeskStats:
-    """7-day trailing performance statistics for a single desk."""
+    """7-day trailing performance statistics for a single desk.
+
+    Attributes
+    ----------
+    win_rate : float
+        *p* — fraction of winning trades in the trailing window.
+    payout_ratio : float
+        *b* — avg_win_pct / avg_loss_pct.  The average dollar won per
+        dollar risked.  Also called the "reward-to-risk ratio".
+    edge : float
+        *p · b − (1 − p)* — the expected value per unit bet.
+        Positive edge means the desk has a statistical advantage.
+    """
 
     desk_id: int
     total_trades: int
     winning_trades: int
     losing_trades: int
-    win_rate: float
+    win_rate: float         # p
     avg_win_pct: float
     avg_loss_pct: float
-    profit_factor: float
+    payout_ratio: float     # b = avg_win / avg_loss
+    edge: float             # p·b − q
     period_days: int
 
 
@@ -108,15 +126,18 @@ class SizeRecommendation:
 
     The ``position_size`` field maps directly to the ``quantity`` key
     in the signal dict passed to ``execute_dynamic_limit_order()``.
+    The full recommendation is also written into the ``desk:{id}:state``
+    Redis hash under the ``kelly_size`` key so the execution engine can
+    read it at order time.
     """
 
     desk_id: int
-    raw_kelly_fraction: float
-    fractional_kelly: float
-    capped_fraction: float
+    raw_kelly_fraction: float    # f* = (p·b − q) / b
+    fractional_kelly: float      # 0.25 × f*
+    capped_fraction: float       # min(fractional, hard_cap)
     account_equity: float
-    position_size: float
-    risk_budget_pct: float
+    position_size: float         # equity × capped_fraction
+    risk_budget_pct: float       # capped_fraction × 100
     stats: DeskStats
     computed_at: str
 
@@ -247,22 +268,27 @@ class KellyAllocator:
             wins = int(row.winning_trades or 0)
             losses = int(row.losing_trades or 0)
 
-            win_rate = wins / total if total > 0 else 0.0
+            p = wins / total if total > 0 else 0.0   # win rate
             avg_win = float(row.avg_win_pct or 0.0)
             avg_loss = float(row.avg_loss_pct or 0.0)
 
-            # Profit factor = avg_win / avg_loss (guard against zero).
-            profit_factor = avg_win / avg_loss if avg_loss > 0 else 0.0
+            # b = avg_win / avg_loss (payout ratio).
+            b = avg_win / avg_loss if avg_loss > 0 else 0.0
+
+            # Edge = p·b − (1−p).  Positive → statistical advantage.
+            q = 1.0 - p
+            edge = p * b - q
 
             stats[did] = DeskStats(
                 desk_id=did,
                 total_trades=total,
                 winning_trades=wins,
                 losing_trades=losses,
-                win_rate=round(win_rate, 6),
+                win_rate=round(p, 6),
                 avg_win_pct=round(avg_win, 8),
                 avg_loss_pct=round(avg_loss, 8),
-                profit_factor=round(profit_factor, 6),
+                payout_ratio=round(b, 6),
+                edge=round(edge, 6),
                 period_days=self._trailing_days,
             )
 
@@ -357,7 +383,7 @@ class KellyAllocator:
             if stats is not None and stats.total_trades >= self._min_trades:
                 eligible_desks.append(did)
                 win_rates_list.append(stats.win_rate)
-                payout_ratios_list.append(stats.profit_factor)
+                payout_ratios_list.append(stats.payout_ratio)
 
         # Compute Kelly fractions in one vectorised call.
         kelly_map: dict[int, float] = {}
@@ -383,7 +409,8 @@ class KellyAllocator:
                     win_rate=0.0,
                     avg_win_pct=0.0,
                     avg_loss_pct=0.0,
-                    profit_factor=0.0,
+                    payout_ratio=0.0,
+                    edge=0.0,
                     period_days=self._trailing_days,
                 )
                 recommendations.append(SizeRecommendation(
@@ -413,16 +440,29 @@ class KellyAllocator:
 
         return recommendations
 
-    # ----- Redis caching ----------------------------------------------------
+    # ----- Redis desk_state update + caching ---------------------------------
 
     def refresh_and_cache(self) -> list[SizeRecommendation]:
-        """Compute all desks and write recommendations to Redis.
+        """Compute all desks, update desk_state, and cache recommendations.
 
-        Stores each recommendation under ``kelly:{desk_id}:recommendation``
-        as a JSON string with a 24-hour TTL so stale data expires
-        automatically if the refresh cycle stops.
+        For each desk this method:
 
-        Requires ``redis`` package (sync client).
+        1. Writes the full ``SizeRecommendation`` JSON to
+           ``kelly:{desk_id}:recommendation`` (24-hour TTL) for
+           dashboards and API consumers.
+        2. Updates the ``desk:{desk_id}:state`` hash with the fields
+           the execution engine reads at order time:
+
+           * ``kelly_size`` — the position size in base currency
+           * ``kelly_fraction`` — the capped fraction (0–1)
+           * ``kelly_edge`` — the desk's estimated edge (p·b − q)
+           * ``kelly_updated_at`` — ISO timestamp of this computation
+
+        The execution engine's ``signal.get("quantity", 1.0)`` can be
+        replaced with a desk_state lookup for ``kelly_size`` to deploy
+        the Kelly-optimal capital per trade.
+
+        Requires the ``redis`` package (sync client).
         """
         import redis
 
@@ -430,17 +470,34 @@ class KellyAllocator:
 
         r = redis.from_url(
             os.getenv("REDIS_URL", _DEFAULT_REDIS_URL),
-            decode_responses=True,
+            decode_responses=False,
         )
 
         pipe = r.pipeline(transaction=False)
         for rec in recs:
-            key = f"kelly:{rec.desk_id}:recommendation"
-            pipe.setex(key, 86_400, rec.to_json())
+            # --- Full recommendation JSON (for dashboards / API) ----------
+            kelly_key = f"kelly:{rec.desk_id}:recommendation"
+            pipe.setex(kelly_key, 86_400, rec.to_json())
+
+            # --- desk_state fields (for execution engine) -----------------
+            state_key = f"desk:{rec.desk_id}:state"
+            pipe.hset(state_key, mapping={
+                b"kelly_size": str(rec.position_size).encode(),
+                b"kelly_fraction": str(rec.capped_fraction).encode(),
+                b"kelly_edge": str(rec.stats.edge).encode(),
+                b"kelly_payout_ratio": str(rec.stats.payout_ratio).encode(),
+                b"kelly_win_rate": str(rec.stats.win_rate).encode(),
+                b"kelly_raw_f": str(rec.raw_kelly_fraction).encode(),
+                b"kelly_updated_at": rec.computed_at.encode(),
+            })
+
         pipe.execute()
 
         logger.info(
-            "Kelly recommendations cached to Redis for %d desks", len(recs),
+            "Kelly allocator: %d desks updated in Redis "
+            "(desk_state + kelly cache) | sizes: %s",
+            len(recs),
+            {r.desk_id: f"${r.position_size:,.0f}" for r in recs},
         )
         return recs
 
@@ -453,9 +510,14 @@ class KellyAllocator:
         computed_at: str,
         raw_kelly_override: float | None = None,
     ) -> SizeRecommendation:
-        """Build a SizeRecommendation from desk stats + Kelly math."""
+        """Build a SizeRecommendation from desk stats + Kelly math.
+
+        f* = (p · b − (1 − p)) / b
+
+        where p = win_rate, b = payout_ratio (avg_win / avg_loss).
+        """
         p = stats.win_rate
-        b = stats.profit_factor
+        b = stats.payout_ratio
         q = 1.0 - p
 
         # f* = (p·b − q) / b
