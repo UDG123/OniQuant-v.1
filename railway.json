@@ -121,6 +121,30 @@
         "REDIS_URL": { "$default": "${{shared.REDIS_URL}}" }
       }
     },
+    "OniQuant-Portfolio-Optimizer": {
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "src/strategies/**",
+          "src/core/**",
+          "src/services/**",
+          "src/workers/portfolio_optimizer.py",
+          "requirements.txt",
+          "Dockerfile"
+        ]
+      },
+      "deploy": {
+        "startCommand": "celery -A src.workers.portfolio_optimizer worker --beat --loglevel=info",
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 5
+      },
+      "envs": {
+        "POSTGRES_URL": { "$default": "${{shared.POSTGRES_URL}}" },
+        "REDIS_URL": { "$default": "${{shared.REDIS_URL}}" }
+      }
+    },
     "OniQuant-MCP-Analyst": {
       "build": {
         "builder": "DOCKERFILE",
