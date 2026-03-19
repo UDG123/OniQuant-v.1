@@ -32,8 +32,11 @@ from sqlalchemy.orm import DeclarativeBase
 
 from src.services.signal_hydration import HydrationError, hydrate_signal
 from src.services.telegram_broadcaster import broadcast_trade
+from src.strategies.desk1_scalping import Desk1ScalpingStrategy
+from src.strategies.desk2_fx import Desk2FXStrategy
 from src.strategies.desk3_swing import Desk3SwingStrategy
 from src.strategies.desk4_gold import Desk4GoldStrategy
+from src.strategies.desk5_crypto import Desk5CryptoStrategy
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -222,7 +225,7 @@ async def tradingview_alert(
     2.  Redis dedup           — drop duplicates, return 202.
     3.  Volatility lock       — veto + log to Postgres, return 202.
     4.  Desk state fetch      — ``get_desk_state(desk_id)``.
-    4b. Strategy evaluation   — Desk 3 Lorentzian / Desk 4 Gold breakout.
+    4b. Strategy evaluation   — All 5 desks: OFI / Kalman / Lorentzian / Gold / CVD.
     5.  Signal hydration      — ``hydrate_signal(dict, dict) -> bytes``.
     6.  ClaudeCTO dispatch    — Consensus Score evaluation.
     7.  Telegram broadcast    — fire-and-forget notification.
@@ -278,43 +281,101 @@ async def tradingview_alert(
     desk_state.setdefault("desk_id", payload.desk_id)
 
     # ------------------------------------------------------------------
-    # Stage 4b — Quantitative strategy evaluation
+    # Stage 4b — Quantitative strategy evaluation (all 5 desks)
     # ------------------------------------------------------------------
     ohlcv = desk_state.get("ohlcv")
     df = pd.DataFrame(ohlcv) if ohlcv is not None else None
+    account_equity = desk_state.get("account_equity", 100_000.0)
 
-    if payload.desk_id == 3 and df is not None and not df.empty:
-        strategy = Desk3SwingStrategy()
-        result = strategy.evaluate(df)
-        desk_state["is_valid_setup"] = result.is_valid_setup
-        desk_state["lorentzian_score"] = result.lorentzian_score
-        desk_state["swing_trend_direction"] = result.trend_direction
-        desk_state["rsi"] = result.rsi
-        desk_state["adx"] = result.adx
-        desk_state["strategy"] = "desk3_lorentzian_swing"
-        logger.info(
-            "Desk 3 Lorentzian eval for %s: valid=%s score=%.4f",
-            payload.signal_id,
-            result.is_valid_setup,
-            result.lorentzian_score,
-        )
+    if df is not None and not df.empty:
+        if payload.desk_id == 1:
+            strategy = Desk1ScalpingStrategy()
+            result = strategy.evaluate(df, account_equity=account_equity)
+            desk_state["ofi_score"] = result.ofi_score
+            desk_state["ofi_raw"] = result.ofi_raw
+            desk_state["price_delta_pct"] = result.price_delta_pct
+            desk_state["dynamic_stop"] = result.dynamic_stop
+            desk_state["is_valid_setup"] = result.is_valid_setup
+            desk_state["strategy_signal"] = result.signal
+            desk_state["strategy"] = "desk1_ofi_scalp"
+            logger.info(
+                "Desk 1 OFI eval for %s: signal=%s ofi=%.4f valid=%s",
+                payload.signal_id,
+                result.signal,
+                result.ofi_score,
+                result.is_valid_setup,
+            )
 
-    elif payload.desk_id == 4 and df is not None and not df.empty:
-        resistance = desk_state.get("resistance", 0.0)
-        support = desk_state.get("support", 0.0)
-        strategy = Desk4GoldStrategy()
-        result = strategy.evaluate(df, resistance=resistance, support=support)
-        desk_state["is_valid_breakout"] = result.is_valid_breakout
-        desk_state["risk_reward_ratio"] = result.risk_reward_ratio
-        desk_state["atr"] = result.atr
-        desk_state["gold_trend_direction"] = result.trend_direction
-        desk_state["strategy"] = "desk4_gold_breakout"
-        logger.info(
-            "Desk 4 Gold eval for %s: breakout=%s rr=%.4f",
-            payload.signal_id,
-            result.is_valid_breakout,
-            result.risk_reward_ratio,
-        )
+        elif payload.desk_id == 2:
+            strategy = Desk2FXStrategy()
+            result = strategy.evaluate(df, account_equity=account_equity)
+            desk_state["kalman_z_score"] = result.kalman_z_score
+            desk_state["kalman_price"] = result.kalman_price
+            desk_state["rsi"] = result.rsi
+            desk_state["atr"] = result.atr
+            desk_state["dynamic_stop"] = result.dynamic_stop
+            desk_state["is_valid_setup"] = result.is_valid_setup
+            desk_state["strategy_signal"] = result.signal
+            desk_state["strategy"] = "desk2_kalman_fx"
+            logger.info(
+                "Desk 2 Kalman eval for %s: signal=%s z=%.4f valid=%s",
+                payload.signal_id,
+                result.signal,
+                result.kalman_z_score,
+                result.is_valid_setup,
+            )
+
+        elif payload.desk_id == 3:
+            strategy = Desk3SwingStrategy()
+            result = strategy.evaluate(df)
+            desk_state["is_valid_setup"] = result.is_valid_setup
+            desk_state["lorentzian_score"] = result.lorentzian_score
+            desk_state["swing_trend_direction"] = result.trend_direction
+            desk_state["rsi"] = result.rsi
+            desk_state["adx"] = result.adx
+            desk_state["strategy"] = "desk3_lorentzian_swing"
+            logger.info(
+                "Desk 3 Lorentzian eval for %s: valid=%s score=%.4f",
+                payload.signal_id,
+                result.is_valid_setup,
+                result.lorentzian_score,
+            )
+
+        elif payload.desk_id == 4:
+            resistance = desk_state.get("resistance", 0.0)
+            support = desk_state.get("support", 0.0)
+            strategy = Desk4GoldStrategy()
+            result = strategy.evaluate(df, resistance=resistance, support=support)
+            desk_state["is_valid_breakout"] = result.is_valid_breakout
+            desk_state["risk_reward_ratio"] = result.risk_reward_ratio
+            desk_state["atr"] = result.atr
+            desk_state["gold_trend_direction"] = result.trend_direction
+            desk_state["strategy"] = "desk4_gold_breakout"
+            logger.info(
+                "Desk 4 Gold eval for %s: breakout=%s rr=%.4f",
+                payload.signal_id,
+                result.is_valid_breakout,
+                result.risk_reward_ratio,
+            )
+
+        elif payload.desk_id == 5:
+            strategy = Desk5CryptoStrategy()
+            result = strategy.evaluate(df, account_equity=account_equity)
+            desk_state["cvd_zscore"] = result.cvd_zscore
+            desk_state["volatility_regime"] = result.volatility_regime
+            desk_state["rsi"] = result.rsi
+            desk_state["atr"] = result.atr
+            desk_state["dynamic_stop"] = result.dynamic_stop
+            desk_state["is_valid_setup"] = result.is_valid_setup
+            desk_state["strategy_signal"] = result.signal
+            desk_state["strategy"] = "desk5_cvd_crypto"
+            logger.info(
+                "Desk 5 CVD eval for %s: signal=%s z=%.4f regime=%s",
+                payload.signal_id,
+                result.signal,
+                result.cvd_zscore,
+                result.volatility_regime,
+            )
 
     # ------------------------------------------------------------------
     # Stage 5 — Signal hydration
