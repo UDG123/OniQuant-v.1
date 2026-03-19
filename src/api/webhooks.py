@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from src.core.observability import pipeline_tracker, track_network_rtt
 from src.services.execution import (
     ExecutionError,
     OrderBroker,
@@ -247,12 +248,21 @@ async def tradingview_alert(
     """
     redis = request.app.state.redis
 
+    # --- Observability: begin pipeline span (Stage 1 = Pydantic done) ---
+    span = pipeline_tracker.start(
+        payload.signal_id, desk_id=payload.desk_id, action=payload.action,
+    )
+    span.mark("1_pydantic_validation")
+
     # ------------------------------------------------------------------
     # Stage 2 — Deduplication
     # ------------------------------------------------------------------
     is_new: bool = await redis.check_duplicate_signal(payload.signal_id)
+    span.mark("2_dedup")
+
     if not is_new:
         logger.info("Duplicate signal dropped: %s", payload.signal_id)
+        span.finish("duplicate")
         return ORJSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
@@ -280,6 +290,8 @@ async def tradingview_alert(
         db.add(veto)
         await db.commit()
 
+        span.mark("3_volatility_lock")
+        span.finish("vetoed")
         return ORJSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
@@ -289,11 +301,14 @@ async def tradingview_alert(
             },
         )
 
+    span.mark("3_volatility_lock")
+
     # ------------------------------------------------------------------
     # Stage 4 — Desk state retrieval
     # ------------------------------------------------------------------
     desk_state: dict = await redis.get_desk_state(payload.desk_id)
     desk_state.setdefault("desk_id", payload.desk_id)
+    span.mark("4_desk_state")
 
     # ------------------------------------------------------------------
     # Stage 4b — Quantitative strategy evaluation (all 5 desks)
@@ -393,6 +408,8 @@ async def tradingview_alert(
                 result.volatility_regime,
             )
 
+    span.mark("4b_strategy_eval")
+
     # ------------------------------------------------------------------
     # Stage 5 — Signal hydration
     # ------------------------------------------------------------------
@@ -403,6 +420,7 @@ async def tradingview_alert(
         logger.error(
             "Hydration failed for %s: %s", payload.signal_id, exc
         )
+        span.finish("hydration_error")
         return ORJSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
@@ -412,10 +430,14 @@ async def tradingview_alert(
             },
         )
 
+    span.mark("5_hydration")
+
     # ------------------------------------------------------------------
     # Stage 6 — ClaudeCTO dispatch
     # ------------------------------------------------------------------
     cto_result: dict = await _dispatch_to_claude_cto(hydrated)
+
+    span.mark("6_claude_cto")
 
     logger.info(
         "Signal %s processed — consensus_score=%s",
@@ -504,6 +526,8 @@ async def tradingview_alert(
             CONSENSUS_THRESHOLD,
         )
 
+    span.mark("7_execution_gate")
+
     # ------------------------------------------------------------------
     # Stage 8 — Telegram broadcast (fire-and-forget)
     # ------------------------------------------------------------------
@@ -516,6 +540,9 @@ async def tradingview_alert(
             "consensus_score": consensus_score,
         }
     )
+
+    span.mark("8_telegram_broadcast")
+    total_ms = span.finish("completed")
 
     response_content: dict[str, Any] = {
         "status": "processed",

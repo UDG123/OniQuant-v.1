@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 import optuna
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.responses import JSONResponse
 from optuna_dashboard import wsgi
@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.api.webhooks import router as webhooks_router
+from src.core.observability import REGISTRY, generate_metrics_text
 from src.services.constitutional_manager import run_audit_loop
 from src.services.redis_manager import RedisStateManager
 
@@ -112,6 +113,27 @@ async def health_deep():
             "status": "ok" if all_healthy else "degraded",
             "checks": checks,
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/v1/metrics")
+async def prometheus_metrics():
+    """Prometheus-compatible metrics endpoint.
+
+    Exports all OpenTelemetry/Prometheus metrics in text exposition format:
+    - Feed latency (exchange → local) histograms and P99 gauge
+    - Pipeline latency (Stage 1 → Stage 8) histograms per stage
+    - Network round-trip latency to external services
+    - Circuit breaker state and trip count
+    """
+    return Response(
+        content=generate_metrics_text(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
     )
 
 

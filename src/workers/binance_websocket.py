@@ -50,6 +50,8 @@ import numpy as np
 import orjson
 import redis.asyncio as aioredis
 
+from src.core.observability import circuit_breaker, feed_tracker
+
 try:
     import websockets
 except ImportError:
@@ -193,6 +195,7 @@ class BookTick:
     obi_raw: float
     obi_zscore: float
     received_at: float
+    exchange_epoch_ms: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -303,12 +306,32 @@ class BinanceBookTickerConsumer:
         if symbol not in self._buffers:
             return None
 
+        # Exchange-originated event timestamp (epoch ms).
+        # Present in futures bookTicker and newer spot API versions.
+        exchange_epoch_ms: int | None = None
+        raw_e = data.get("E") or data.get("T")
+        if raw_e is not None:
+            try:
+                exchange_epoch_ms = int(raw_e)
+            except (TypeError, ValueError):
+                pass
+
+        local_epoch_ms = time.time() * 1000.0
+
         micro = compute_micro_price(best_bid, best_ask, bid_qty, ask_qty)
         obi_raw = compute_obi_raw(bid_qty, ask_qty)
 
         buf = self._buffers[symbol]
         buf.push(obi_raw)
         obi_z = buf.z_score(obi_raw)
+
+        # --- Feed latency tracking ---
+        feed_tracker.record_tick(
+            symbol=symbol,
+            exchange_epoch_ms=exchange_epoch_ms,
+            local_epoch_ms=local_epoch_ms,
+            source="binance",
+        )
 
         return BookTick(
             symbol=symbol,
@@ -319,7 +342,8 @@ class BinanceBookTickerConsumer:
             micro_price=round(micro, 8),
             obi_raw=round(obi_raw, 6),
             obi_zscore=round(obi_z, 4),
-            received_at=time.time(),
+            received_at=local_epoch_ms / 1000.0,
+            exchange_epoch_ms=exchange_epoch_ms,
         )
 
     # ----- Redis desk state update ------------------------------------------
@@ -466,6 +490,11 @@ class BinanceBookTickerConsumer:
                         # Fire-and-forget Redis update + dispatch eval.
                         await self._update_desk_state(tick)
                         await self._evaluate_dispatch(tick)
+
+                        # Circuit breaker: auto-halt on sustained P99 breach.
+                        if tick.exchange_epoch_ms is not None and self._redis:
+                            p99 = feed_tracker.get_p99(tick.symbol)
+                            await circuit_breaker.evaluate(p99, self._redis)
 
             except asyncio.CancelledError:
                 logger.info("Consumer cancelled — shutting down")
