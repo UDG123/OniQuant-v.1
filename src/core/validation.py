@@ -6,6 +6,16 @@ for both parameter sets across all blocks, and applies a Welch t-test
 on the OOS block to determine whether the Challenger's Sortino
 improvement is statistically significant (p < 0.05).
 
+The ``ValidationReport`` includes a full ``HypothesisTestProof`` with
+the mathematical derivation: Welch-Satterthwaite degrees of freedom,
+Cohen's d effect size, confidence interval, and the Sortino formula
+used for evaluation.
+
+References
+----------
+[16] Bailey, D. H. et al. "The Deflated Sharpe Ratio" (2014).
+[21] Harvey, C. R. & Liu, Y. "Backtesting" (2015).
+
 Usage::
 
     from src.core.validation import walk_forward_validate
@@ -23,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -60,9 +71,123 @@ class BlockMetrics(BaseModel):
     acceptance_rate: float = Field(..., description="accepted / total")
     sortino_ratio: float = Field(..., description="Annualised Sortino (MAR=0)")
     mean_return: float = Field(..., description="Arithmetic mean of accepted returns")
+    downside_deviation: float = Field(
+        ..., description="Std-dev of negative returns (ddof=1)",
+    )
     win_rate: float = Field(..., description="Fraction of accepted trades with pnl > 0")
     max_drawdown_pct: float = Field(
         ..., description="Maximum peak-to-trough drawdown on the equity curve",
+    )
+
+
+class SampleStatistics(BaseModel):
+    """Descriptive statistics for one OOS sample — feeds the t-test proof."""
+
+    label: str = Field(..., description="'champion' or 'challenger'")
+    n: int = Field(..., description="Sample size (n_accepted in OOS)")
+    mean: float = Field(..., description="Sample mean of OOS returns")
+    std: float = Field(..., description="Sample std-dev (ddof=1)")
+    variance: float = Field(..., description="s^2 = std^2")
+    sortino_ratio: float = Field(..., description="Annualised Sortino on OOS")
+
+
+class HypothesisTestProof(BaseModel):
+    """Full mathematical proof of the Independent Welch t-test.
+
+    Documents every intermediate value so the promotion decision is
+    auditable and reproducible.
+
+    Formulas
+    --------
+    Welch t-statistic::
+
+        t = (x_bar_1 - x_bar_2) / sqrt(s1^2/n1 + s2^2/n2)
+
+    Welch-Satterthwaite degrees of freedom::
+
+        df = (s1^2/n1 + s2^2/n2)^2
+             / ( (s1^2/n1)^2/(n1-1) + (s2^2/n2)^2/(n2-1) )
+
+    Cohen's d (pooled)::
+
+        d = (x_bar_1 - x_bar_2) / s_pooled
+        s_pooled = sqrt( ((n1-1)*s1^2 + (n2-1)*s2^2) / (n1+n2-2) )
+
+    Sortino ratio (annualised, MAR = 0)::
+
+        Sortino = (mean_return / downside_std) * sqrt(252)
+
+    Confidence interval for the mean difference::
+
+        CI = (x_bar_1 - x_bar_2) +/- t_crit * SE
+        SE = sqrt(s1^2/n1 + s2^2/n2)
+    """
+
+    null_hypothesis: str = Field(
+        default=(
+            "H0: mu_challenger = mu_champion — the mean OOS return of the "
+            "Challenger equals the mean OOS return of the Champion."
+        ),
+    )
+    alternative_hypothesis: str = Field(
+        default=(
+            "H1: mu_challenger != mu_champion — the mean OOS returns differ."
+        ),
+    )
+
+    challenger_stats: SampleStatistics
+    champion_stats: SampleStatistics
+
+    # Welch t-test intermediates
+    standard_error: float = Field(
+        ..., description="SE = sqrt(s1^2/n1 + s2^2/n2)",
+    )
+    t_statistic: float = Field(
+        ..., description="t = (x_bar_challenger - x_bar_champion) / SE",
+    )
+    degrees_of_freedom: float = Field(
+        ..., description="Welch-Satterthwaite approximate df",
+    )
+    p_value: float = Field(..., description="Two-sided p-value from t(df)")
+    significance_level: float = Field(
+        default=_SIGNIFICANCE_LEVEL,
+        description="Alpha threshold for rejection of H0",
+    )
+    reject_null: bool = Field(..., description="True when p < alpha")
+
+    # Confidence interval on the mean difference
+    mean_difference: float = Field(
+        ..., description="x_bar_challenger - x_bar_champion",
+    )
+    ci_lower: float = Field(..., description="Lower bound of (1-alpha) CI")
+    ci_upper: float = Field(..., description="Upper bound of (1-alpha) CI")
+
+    # Effect size
+    cohens_d: float = Field(
+        ..., description="Cohen's d (pooled SD) — effect magnitude",
+    )
+    effect_interpretation: str = Field(
+        ..., description="Negligible / Small / Medium / Large per Cohen (1988)",
+    )
+
+    # Sortino-specific gate
+    sortino_improvement: bool = Field(
+        ..., description="True when Challenger OOS Sortino > Champion OOS Sortino",
+    )
+    sortino_delta: float = Field(
+        ..., description="Challenger Sortino - Champion Sortino on OOS",
+    )
+
+    # Final decision
+    sortino_formula: str = Field(
+        default="Sortino = (mean_return / downside_std) * sqrt(252)  [MAR = 0]",
+    )
+    promotion_gates: dict[str, bool] = Field(
+        ...,
+        description=(
+            "All three gates must be True for promotion: "
+            "sortino_improved, statistically_significant, positive_direction"
+        ),
     )
 
 
@@ -77,21 +202,19 @@ class ParamSetReport(BaseModel):
 
 
 class ValidationReport(BaseModel):
-    """Complete Walk-Forward Analysis report comparing Champion vs. Challenger."""
+    """Complete Walk-Forward Analysis report comparing Champion vs. Challenger.
+
+    Contains the ``proof`` field — a ``HypothesisTestProof`` with the
+    full mathematical derivation of the statistical test, intermediate
+    values, and promotion decision logic.
+    """
 
     verdict: Verdict
     promote_challenger: bool = Field(
         ..., description="True when Challenger passes all gates",
     )
-    t_statistic: float = Field(
-        ..., description="Welch t-test statistic (Challenger - Champion OOS returns)",
-    )
-    p_value: float = Field(
-        ..., description="Two-sided p-value from Welch t-test",
-    )
-    significance_level: float = Field(
-        default=_SIGNIFICANCE_LEVEL,
-        description="Required p-value threshold for promotion",
+    proof: HypothesisTestProof = Field(
+        ..., description="Full math proof of the Welch t-test and promotion logic",
     )
     challenger: ParamSetReport
     champion: ParamSetReport
@@ -112,7 +235,9 @@ class ValidationReport(BaseModel):
 def _compute_sortino(returns: np.ndarray) -> float:
     """Annualised Sortino ratio (MAR = 0).
 
-    Matches the implementation in ``src.core.optimizer`` exactly.
+    Matches the implementation in ``src.core.optimizer`` exactly::
+
+        Sortino = (mean_return / downside_std) * sqrt(252)
     """
     if len(returns) < 2:
         return 0.0
@@ -132,6 +257,14 @@ def _compute_sortino(returns: np.ndarray) -> float:
         return 0.0
 
     return float((mean_return / downside_std) * np.sqrt(_ANNUAL_TRADING_PERIODS))
+
+
+def _downside_deviation(returns: np.ndarray) -> float:
+    """Sample standard deviation of negative returns (ddof=1)."""
+    downside = returns[returns < 0.0]
+    if len(downside) < 2:
+        return 0.0
+    return float(np.std(downside, ddof=1))
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +403,15 @@ def _simulate_block(
         if _would_take_trade(t, params):
             accepted_returns.append(t["pnl_pct"])
 
-    returns = np.array(accepted_returns, dtype=np.float64) if accepted_returns else np.array([], dtype=np.float64)
+    returns = (
+        np.array(accepted_returns, dtype=np.float64)
+        if accepted_returns
+        else np.array([], dtype=np.float64)
+    )
     n_accepted = len(returns)
 
     sortino = _compute_sortino(returns)
+    dd = _downside_deviation(returns)
     mean_ret = float(np.mean(returns)) if n_accepted > 0 else 0.0
     win = float(np.mean(returns > 0)) if n_accepted > 0 else 0.0
     mdd = _max_drawdown(returns) if n_accepted >= 2 else 0.0
@@ -286,6 +424,7 @@ def _simulate_block(
         acceptance_rate=round(acc_rate, 6),
         sortino_ratio=round(sortino, 6),
         mean_return=round(mean_ret, 8),
+        downside_deviation=round(dd, 8),
         win_rate=round(win, 6),
         max_drawdown_pct=round(mdd, 6),
     )
@@ -314,6 +453,121 @@ def _partition_trades(
     validate_end = train_end + int(n * validate_pct)
 
     return trades[:train_end], trades[train_end:validate_end], trades[validate_end:]
+
+
+# ---------------------------------------------------------------------------
+# Math proof construction
+# ---------------------------------------------------------------------------
+
+
+def _interpret_cohens_d(d: float) -> str:
+    """Interpret Cohen's d magnitude per Cohen (1988) conventions."""
+    abs_d = abs(d)
+    if abs_d < 0.2:
+        return "Negligible"
+    if abs_d < 0.5:
+        return "Small"
+    if abs_d < 0.8:
+        return "Medium"
+    return "Large"
+
+
+def _build_proof(
+    cl_oos_returns: np.ndarray,
+    ch_oos_returns: np.ndarray,
+    cl_oos_sortino: float,
+    ch_oos_sortino: float,
+    significance_level: float,
+) -> HypothesisTestProof:
+    """Construct the full hypothesis-test proof from OOS return arrays.
+
+    Computes the Welch t-statistic, Welch-Satterthwaite degrees of
+    freedom, confidence interval, and Cohen's d — all from first
+    principles so every intermediate is auditable.
+    """
+    # --- Sample statistics ---
+    n1 = len(cl_oos_returns)
+    n2 = len(ch_oos_returns)
+    x1 = float(np.mean(cl_oos_returns))
+    x2 = float(np.mean(ch_oos_returns))
+    s1 = float(np.std(cl_oos_returns, ddof=1))
+    s2 = float(np.std(ch_oos_returns, ddof=1))
+    v1 = s1 ** 2
+    v2 = s2 ** 2
+
+    # --- Welch t-statistic ---
+    #   t = (x1 - x2) / sqrt(s1^2/n1 + s2^2/n2)
+    se = math.sqrt(v1 / n1 + v2 / n2)
+    t_stat = (x1 - x2) / se if se > 0 else 0.0
+
+    # --- Welch-Satterthwaite degrees of freedom ---
+    #   df = (s1^2/n1 + s2^2/n2)^2
+    #        / ( (s1^2/n1)^2/(n1-1) + (s2^2/n2)^2/(n2-1) )
+    numerator = (v1 / n1 + v2 / n2) ** 2
+    denominator = ((v1 / n1) ** 2 / (n1 - 1)) + ((v2 / n2) ** 2 / (n2 - 1))
+    df = numerator / denominator if denominator > 0 else 1.0
+
+    # --- p-value (two-sided) from Student t-distribution ---
+    p_value = float(2.0 * stats.t.sf(abs(t_stat), df))
+
+    # --- Confidence interval for mean difference ---
+    #   CI = (x1 - x2) +/- t_crit * SE
+    t_crit = float(stats.t.ppf(1.0 - significance_level / 2.0, df))
+    mean_diff = x1 - x2
+    ci_lower = mean_diff - t_crit * se
+    ci_upper = mean_diff + t_crit * se
+
+    # --- Cohen's d (pooled SD) ---
+    #   s_pooled = sqrt( ((n1-1)*s1^2 + (n2-1)*s2^2) / (n1+n2-2) )
+    #   d = (x1 - x2) / s_pooled
+    pooled_var = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+    s_pooled = math.sqrt(pooled_var) if pooled_var > 0 else 0.0
+    cohens_d = mean_diff / s_pooled if s_pooled > 0 else 0.0
+
+    # --- Gate evaluation ---
+    reject_null = p_value < significance_level
+    sortino_improved = cl_oos_sortino > ch_oos_sortino
+    positive_direction = t_stat > 0
+
+    challenger_sample = SampleStatistics(
+        label="challenger",
+        n=n1,
+        mean=round(x1, 8),
+        std=round(s1, 8),
+        variance=round(v1, 10),
+        sortino_ratio=round(cl_oos_sortino, 6),
+    )
+    champion_sample = SampleStatistics(
+        label="champion",
+        n=n2,
+        mean=round(x2, 8),
+        std=round(s2, 8),
+        variance=round(v2, 10),
+        sortino_ratio=round(ch_oos_sortino, 6),
+    )
+
+    return HypothesisTestProof(
+        challenger_stats=challenger_sample,
+        champion_stats=champion_sample,
+        standard_error=round(se, 10),
+        t_statistic=round(t_stat, 6),
+        degrees_of_freedom=round(df, 4),
+        p_value=round(p_value, 8),
+        significance_level=significance_level,
+        reject_null=reject_null,
+        mean_difference=round(mean_diff, 8),
+        ci_lower=round(ci_lower, 8),
+        ci_upper=round(ci_upper, 8),
+        cohens_d=round(cohens_d, 6),
+        effect_interpretation=_interpret_cohens_d(cohens_d),
+        sortino_improvement=sortino_improved,
+        sortino_delta=round(cl_oos_sortino - ch_oos_sortino, 6),
+        promotion_gates={
+            "sortino_improved": sortino_improved,
+            "statistically_significant": reject_null,
+            "positive_direction": positive_direction,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +609,7 @@ def walk_forward_validate(
     -------
     ValidationReport
         Pydantic model with per-block metrics for both param sets,
-        t-test results, and a promotion verdict.
+        full hypothesis-test proof, and a promotion verdict.
     """
     oos_pct = round(1.0 - train_pct - validate_pct, 6)
 
@@ -386,8 +640,7 @@ def walk_forward_validate(
     cl_val, _ = _simulate_block(validate_block, challenger_params, "Validate")
     cl_oos, cl_oos_returns = _simulate_block(oos_block, challenger_params, "OOS")
 
-    # --- Statistical test on OOS returns ---
-    # Check if we have enough OOS trades for a meaningful test.
+    # --- Build proof (or stub for insufficient data) ---
     if len(ch_oos_returns) < _MIN_OOS_TRADES or len(cl_oos_returns) < _MIN_OOS_TRADES:
         logger.warning(
             "Insufficient OOS trades for t-test: champion=%d challenger=%d (min=%d)",
@@ -395,12 +648,49 @@ def walk_forward_validate(
             len(cl_oos_returns),
             _MIN_OOS_TRADES,
         )
+        # Produce a stub proof with zeroed-out statistics.
+        stub_cl = SampleStatistics(
+            label="challenger",
+            n=len(cl_oos_returns),
+            mean=float(np.mean(cl_oos_returns)) if len(cl_oos_returns) > 0 else 0.0,
+            std=float(np.std(cl_oos_returns, ddof=1)) if len(cl_oos_returns) > 1 else 0.0,
+            variance=0.0,
+            sortino_ratio=cl_oos.sortino_ratio,
+        )
+        stub_ch = SampleStatistics(
+            label="champion",
+            n=len(ch_oos_returns),
+            mean=float(np.mean(ch_oos_returns)) if len(ch_oos_returns) > 0 else 0.0,
+            std=float(np.std(ch_oos_returns, ddof=1)) if len(ch_oos_returns) > 1 else 0.0,
+            variance=0.0,
+            sortino_ratio=ch_oos.sortino_ratio,
+        )
+        proof = HypothesisTestProof(
+            challenger_stats=stub_cl,
+            champion_stats=stub_ch,
+            standard_error=0.0,
+            t_statistic=0.0,
+            degrees_of_freedom=0.0,
+            p_value=1.0,
+            significance_level=significance_level,
+            reject_null=False,
+            mean_difference=0.0,
+            ci_lower=0.0,
+            ci_upper=0.0,
+            cohens_d=0.0,
+            effect_interpretation="Negligible",
+            sortino_improvement=False,
+            sortino_delta=0.0,
+            promotion_gates={
+                "sortino_improved": False,
+                "statistically_significant": False,
+                "positive_direction": False,
+            },
+        )
         return ValidationReport(
             verdict=Verdict.INSUFFICIENT_DATA,
             promote_challenger=False,
-            t_statistic=0.0,
-            p_value=1.0,
-            significance_level=significance_level,
+            proof=proof,
             challenger=ParamSetReport(
                 label="challenger",
                 params=challenger_params,
@@ -421,48 +711,40 @@ def walk_forward_validate(
             total_trades=len(sorted_trades),
         )
 
-    # Welch's t-test (unequal variances, two-sided).
-    # H0: mean(challenger_oos) == mean(champion_oos)
-    # H1: mean(challenger_oos) != mean(champion_oos)
-    t_stat, p_value = stats.ttest_ind(
+    # --- Full proof from first principles ---
+    proof = _build_proof(
         cl_oos_returns,
         ch_oos_returns,
-        equal_var=False,
+        cl_oos.sortino_ratio,
+        ch_oos.sortino_ratio,
+        significance_level,
     )
-    t_stat = float(t_stat)
-    p_value = float(p_value)
 
-    # --- Promotion decision ---
-    # The Challenger is promoted only when ALL three conditions hold:
-    #   1. OOS Sortino is strictly higher than Champion's.
-    #   2. The improvement is statistically significant (p < α).
-    #   3. Challenger t-statistic is positive (mean returns are higher).
-    sortino_improvement = cl_oos.sortino_ratio > ch_oos.sortino_ratio
-    significant = p_value < significance_level
-    positive_direction = t_stat > 0
-
-    promote = sortino_improvement and significant and positive_direction
-
+    # --- Promotion decision: all three gates must be True ---
+    gates = proof.promotion_gates
+    promote = all(gates.values())
     verdict = Verdict.PROMOTE if promote else Verdict.REJECT
 
     logger.info(
         "Walk-forward result: verdict=%s | "
         "challenger_oos_sortino=%.4f champion_oos_sortino=%.4f | "
-        "t=%.4f p=%.6f (α=%.2f)",
+        "t=%.4f p=%.6f df=%.1f cohen_d=%.4f (alpha=%.2f) | "
+        "gates=%s",
         verdict.value,
         cl_oos.sortino_ratio,
         ch_oos.sortino_ratio,
-        t_stat,
-        p_value,
+        proof.t_statistic,
+        proof.p_value,
+        proof.degrees_of_freedom,
+        proof.cohens_d,
         significance_level,
+        gates,
     )
 
     return ValidationReport(
         verdict=verdict,
         promote_challenger=promote,
-        t_statistic=round(t_stat, 6),
-        p_value=round(p_value, 8),
-        significance_level=significance_level,
+        proof=proof,
         challenger=ParamSetReport(
             label="challenger",
             params=challenger_params,
